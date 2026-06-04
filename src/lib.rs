@@ -2,6 +2,7 @@ pub mod brute_force;
 pub mod index;
 pub mod io;
 pub mod ivf;
+pub mod manifest;
 pub mod mstg;
 
 #[cfg(feature = "python")]

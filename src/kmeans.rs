@@ -7,7 +7,7 @@ use rand::RngCore;
 use rayon::prelude::*;
 
 const RESEED_CANDIDATES: usize = 8;
-const DEFAULT_MAX_POINTS_PER_CENTROID: usize = 256;
+const DEFAULT_MAX_POINTS_PER_CENTROID: usize = 64;
 const DEFAULT_DECODE_BLOCK_SIZE: usize = 32768;
 
 #[derive(Debug, Clone)]
