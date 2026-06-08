@@ -43,6 +43,8 @@ struct Args {
     metric: Metric,
     seed: u64,
     limit: Option<usize>,
+    stream: bool,
+    stream_batch_size: usize,
 }
 
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
@@ -60,6 +62,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut metric = Metric::L2;
     let mut seed = 42u64;
     let mut limit = None;
+    let mut stream = false;
+    let mut stream_batch_size = 100_000usize;
 
     let mut i = 1;
     while i < args.len() {
@@ -121,6 +125,13 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                 i += 1;
                 limit = Some(args[i].parse()?);
             }
+            "--stream" => {
+                stream = true;
+            }
+            "--stream-batch-size" => {
+                i += 1;
+                stream_batch_size = args[i].parse()?;
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(1);
@@ -164,6 +175,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         metric,
         seed,
         limit,
+        stream,
+        stream_batch_size,
     })
 }
 
@@ -275,6 +288,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             RotatorType::FhtKacRotator,
             args.seed,
             args.faster_config,
+        )?
+    } else if args.stream {
+        let nlist = args.nlist.ok_or("--nlist is required")?;
+        let total_vectors = vectors.len();
+        let batch_size = args.stream_batch_size;
+        println!(
+            "Building IVF+RaBitQ index (streaming, {} clusters, {}-bit, {} batches)...",
+            nlist, args.bits,
+            total_vectors.div_ceil(batch_size)
+        );
+
+        let chunks: Vec<Vec<f32>> = vectors
+            .chunks(batch_size)
+            .map(|chunk| {
+                let mut flat = Vec::with_capacity(chunk.len() * dim);
+                for v in chunk { flat.extend_from_slice(v); }
+                flat
+            })
+            .collect();
+        drop(vectors);
+
+        IvfRabitqIndex::train_from_batches(
+            &chunks, dim, total_vectors, nlist, args.bits,
+            args.metric, RotatorType::FhtKacRotator, args.seed, args.faster_config,
         )?
     } else {
         let nlist = args.nlist.ok_or("--nlist is required")?;

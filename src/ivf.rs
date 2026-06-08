@@ -1096,6 +1096,154 @@ impl IvfRabitqIndex {
         )
     }
 
+    // ========================================================================
+    // Streaming batch-oriented training (memory-efficient)
+    // ========================================================================
+
+    /// Build an IVF+RaBitQ index from flat batches (memory-efficient).
+    ///
+    /// Each element of `batches` is a flat `Vec<f32>` holding `[n_i * dim]`
+    /// row-major vectors.  Batches are iterated twice (k-means sampling,
+    /// then rotation+quantisation).  Peak memory is bounded by the largest
+    /// batch + k-means reservoir (~nlist*64 vectors) + centroids.
+    pub fn train_from_batches(
+        batches: &[Vec<f32>],
+        dim: usize,
+        total_vectors: usize,
+        nlist: usize,
+        total_bits: usize,
+        metric: Metric,
+        rotator_type: RotatorType,
+        seed: u64,
+        use_faster_config: bool,
+    ) -> Result<Self, RabitqError> {
+        use crate::kmeans::{run_kmeans_on_flat, KMeansConfig};
+        use rayon::prelude::*;
+
+        if dim == 0 { return Err(RabitqError::InvalidConfig("dimension must be positive")); }
+        if nlist == 0 { return Err(RabitqError::InvalidConfig("nlist must be positive")); }
+        if total_vectors < nlist {
+            return Err(RabitqError::InvalidConfig("nlist cannot exceed number of vectors"));
+        }
+
+        let ex_bits = total_bits.saturating_sub(1);
+        let rotator = DynamicRotator::new(dim, rotator_type, seed);
+        let padded_dim = rotator.padded_dim();
+        crate::memory::log_huge_page_status();
+
+        // --- Pass 1: Reservoir sample for k-means ---
+        println!("K-means: {} clusters, reservoir sampling {} batches...", nlist, batches.len());
+        let max_points_per_centroid: usize = 64;
+        let reservoir_size = nlist * max_points_per_centroid;
+        let mut rng = StdRng::seed_from_u64(seed ^ 0x5a5a_5a5a5a5a5a5a);
+
+        // Reservoir sample by iterating all batches
+        let mut reservoir: Vec<f32> = Vec::new();
+        let mut reservoir_count: usize = 0;
+        let mut seen: usize = 0;
+        for batch in batches {
+            let n = batch.len() / dim;
+            for i in 0..n {
+                let vec_slice = &batch[i * dim..(i + 1) * dim];
+                if reservoir_count < reservoir_size {
+                    reservoir.extend_from_slice(vec_slice);
+                    reservoir_count += 1;
+                } else {
+                    let j = rng.gen_range(0..seen + 1);
+                    if j < reservoir_size {
+                        let dst = j * dim;
+                        reservoir[dst..dst + dim].copy_from_slice(vec_slice);
+                    }
+                }
+                seen += 1;
+            }
+        }
+        println!("  Reservoir sampled {} / {} vectors ({:.1} MB)", reservoir_count, seen, reservoir_count * dim * 4 / (1024 * 1024));
+
+        let sample_points = reservoir_count;
+        if sample_points == 0 {
+            return Err(RabitqError::InvalidConfig("no training data sampled"));
+        }
+
+        // Rotate sample
+        let rotated_sample: Vec<f32> = {
+            let mut out = Vec::with_capacity(sample_points * padded_dim);
+            for i in 0..sample_points {
+                let v = &reservoir[i * dim..(i + 1) * dim];
+                out.extend_from_slice(&rotator.rotate(v));
+            }
+            out
+        };
+        drop(reservoir);
+
+        let kmeans_config = KMeansConfig {
+            niter: 15, nredo: 1, seed: rng.next_u64(),
+            spherical: false, max_points_per_centroid,
+            decode_block_size: 32768,
+        };
+        let KMeansResult { centroids: rotated_centroids, .. } =
+            run_kmeans_on_flat(&rotated_sample, sample_points, padded_dim, nlist, kmeans_config);
+        drop(rotated_sample);
+        println!("K-means complete ({} clusters)", rotated_centroids.len());
+
+        // --- Init empty clusters ---
+        let config = if use_faster_config {
+            RabitqConfig::faster(padded_dim, total_bits, seed)
+        } else {
+            RabitqConfig::new(total_bits)
+        };
+        let mut clusters: Vec<ClusterData> = rotated_centroids.iter().map(|c| ClusterData {
+            centroid: c.clone(), ids: Vec::new(), batch_data: Vec::new(),
+            ex_codes_packed: Vec::new(), f_add_ex: Vec::new(), f_rescale_ex: Vec::new(),
+            delta: Vec::new(), vl: Vec::new(), num_vectors: 0,
+            padded_dim, ex_bits, pending_ids: Vec::new(), pending_vectors: Vec::new(),
+        }).collect();
+
+        // --- Pass 2: Rotate → assign → quantise ---
+        println!("Rotating + quantising {} batches...", batches.len());
+        let mut global_id: usize = 0;
+        let centroid_col: Vec<f32> = {
+            let mut col = vec![0.0f32; padded_dim * nlist];
+            for (cid, c) in rotated_centroids.iter().enumerate() {
+                for d in 0..padded_dim { col[d * nlist + cid] = c[d]; }
+            }
+            col
+        };
+        let centroid_norms: Vec<f32> = rotated_centroids.iter().map(|c| c.iter().map(|x| x*x).sum()).collect();
+
+        for (bi, batch) in batches.iter().enumerate() {
+            let batch_n = batch.len() / dim;
+            let rotated_batch: Vec<f32> = {
+                let mut out = Vec::with_capacity(batch_n * padded_dim);
+                for i in 0..batch_n {
+                    let v = &batch[i * dim..(i + 1) * dim];
+                    out.extend_from_slice(&rotator.rotate(v));
+                }
+                out
+            };
+            let batch_ids = assign_batch_to_centroids(&rotated_batch, batch_n, nlist, padded_dim, &centroid_col, &centroid_norms);
+            let insertions: Vec<(usize, QuantizedVector)> = (0..batch_n).into_par_iter().map(|i| {
+                let rv = &rotated_batch[i * padded_dim..(i + 1) * padded_dim];
+                let cid = batch_ids[i];
+                let q = crate::quantizer::quantize_with_centroid(rv, &clusters[cid].centroid, &config, metric);
+                (cid, q)
+            }).collect();
+            drop(rotated_batch);
+            for (i, (cid, q)) in insertions.into_iter().enumerate() {
+                clusters[cid].append_vector(global_id + i, q);
+            }
+            global_id += batch_n;
+            if (bi + 1).is_multiple_of(5) || global_id >= total_vectors {
+                println!("  Processed {} / {} vectors ({:.1}%)", global_id, total_vectors, 100.0 * global_id as f64 / total_vectors as f64);
+            }
+        }
+        for c in &mut clusters { c.flush_pending(); }
+        println!("Quantisation complete ({} vectors)", global_id);
+
+        let ip_func = crate::simd::select_excode_ipfunc(ex_bits);
+        Ok(Self { dim, padded_dim, metric, rotator, clusters, ex_bits, ip_func })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_from_rotated(
         dim: usize,
@@ -2285,16 +2433,14 @@ impl IvfRabitqIndex {
     // V4 Persistence (Manifest + Segment files, S3-compatible)
     // ========================================================================
 
-    /// Save the index in V4 format: a directory containing a `manifest.bin`
-    /// and per-cluster `cluster_XXXX_vYYYY.seg` files.
     /// Flush all pending vectors into batch_data across all clusters.
-    /// Call this before save to ensure data is serialized.
     pub fn flush_all_pending(&mut self) {
         for cluster in &mut self.clusters {
             cluster.flush_pending();
         }
     }
 
+    /// Save the index in V4 format.
     pub fn save_to_v4_dir<P: AsRef<Path>>(&self, dir: P) -> Result<(), RabitqError> {
         use crate::manifest::{self, ClusterManifestEntry, ClusterSegmentData, ManifestHeader};
 
@@ -2625,6 +2771,50 @@ impl IvfRabitqIndex {
         }
         best_cid
     }
+}
+
+// ----------------------------------------------------------------------------
+// Standalone helpers
+// ----------------------------------------------------------------------------
+
+/// Batch-assign vectors to nearest centroids using GEMM + row-wise argmin.
+fn assign_batch_to_centroids(
+    rotated_batch: &[f32],
+    batch_n: usize,
+    nlist: usize,
+    padded_dim: usize,
+    centroid_col: &[f32],
+    centroid_norms: &[f32],
+) -> Vec<usize> {
+    let k = nlist;
+    let mut dot_products = vec![0.0f32; batch_n * k];
+    unsafe {
+        matrixmultiply::sgemm(
+            batch_n, padded_dim, k, 1.0,
+            rotated_batch.as_ptr(), padded_dim as isize, 1,
+            centroid_col.as_ptr(), k as isize, 1,
+            0.0, dot_products.as_mut_ptr(), k as isize, 1,
+        );
+    }
+    let norms: Vec<f32> = (0..batch_n)
+        .map(|i| {
+            rotated_batch[i * padded_dim..(i + 1) * padded_dim]
+                .iter().map(|x| x * x).sum()
+        })
+        .collect();
+    let mut assignments = Vec::with_capacity(batch_n);
+    for i in 0..batch_n {
+        let mut best_cid = 0usize;
+        let mut best_dist = f32::INFINITY;
+        for c in 0..k {
+            let dot = dot_products[i * k + c];
+            let mut dist = norms[i] + centroid_norms[c] - 2.0 * dot;
+            if dist < 0.0 { dist = 0.0; }
+            if dist < best_dist { best_dist = dist; best_cid = c; }
+        }
+        assignments.push(best_cid);
+    }
+    assignments
 }
 
 // ----------------------------------------------------------------------------

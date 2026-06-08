@@ -692,6 +692,108 @@ fn compute_chunk_assignments_only(
     assignments
 }
 
+// ============================================================================
+// Streaming / reservoir-sampling k-means for batch-oriented input
+// ============================================================================
+
+/// Run reservoir sampling over streaming flat batches, returning a flat
+/// `Vec<f32>` holding up to `reservoir_size` vectors (row-major, `res * dim`).
+pub fn reservoir_sample_from_batches(
+    mut next_batch: impl FnMut() -> Option<Vec<f32>>,
+    dim: usize,
+    reservoir_size: usize,
+    rng: &mut StdRng,
+) -> Vec<f32> {
+    use rand::Rng;
+
+    let mut reservoir: Vec<f32> = Vec::new();       // flat, row-major
+    let mut reservoir_count: usize = 0;              // number of vectors currently in reservoir
+    let mut seen: usize = 0;
+
+    while let Some(batch) = next_batch() {
+        let n = batch.len() / dim;
+        for i in 0..n {
+            let vec_slice = &batch[i * dim..(i + 1) * dim];
+            if reservoir_count < reservoir_size {
+                reservoir.extend_from_slice(vec_slice);
+                reservoir_count += 1;
+            } else {
+                let j = rng.gen_range(0..seen + 1);
+                if j < reservoir_size {
+                    let dst = j * dim;
+                    reservoir[dst..dst + dim].copy_from_slice(vec_slice);
+                }
+            }
+            seen += 1;
+        }
+    }
+
+    if reservoir_count < reservoir_size {
+        reservoir.truncate(reservoir_count * dim);
+    }
+
+    println!(
+        "  Reservoir sampled {} / {} vectors ({:.1} MB)",
+        reservoir_count,
+        seen,
+        reservoir_count * dim * 4 / (1024 * 1024)
+    );
+
+    reservoir
+}
+
+/// Run k-means on a flat training set (already in memory).
+/// This is the core Lloyd-iteration loop operating on row-major `&[f32]`.
+pub fn run_kmeans_on_flat(
+    training: &[f32],
+    num_points: usize,
+    dim: usize,
+    k: usize,
+    config: KMeansConfig,
+) -> KMeansResult {
+    let mut rng = StdRng::seed_from_u64(config.seed);
+
+    // Initialize centroids
+    let mut indices: Vec<usize> = (0..num_points).collect();
+    indices.shuffle(&mut rng);
+    indices.truncate(k);
+
+    let mut centroids = Vec::with_capacity(k * dim);
+    for &idx in &indices {
+        centroids.extend_from_slice(&training[idx * dim..(idx + 1) * dim]);
+    }
+
+    let norms = compute_norms(training, num_points, dim);
+    let mut assignments = vec![0usize; num_points];
+
+    run_lloyd_iterations(
+        &mut centroids,
+        config.niter,
+        k,
+        dim,
+        training,
+        &norms,
+        &mut assignments,
+        &mut rng,
+        config.spherical,
+        config.decode_block_size,
+    );
+
+    let centroid_views: Vec<f32> = centroids.clone();
+    let centroid_norms: Vec<f32> = centroids
+        .chunks(dim)
+        .map(|c| c.iter().map(|x| x * x).sum())
+        .collect();
+
+    let objective = compute_objective(training, &centroids, &assignments, num_points, dim);
+
+    KMeansResult {
+        centroids: centroids.chunks(dim).map(|c| c.to_vec()).collect(),
+        assignments,
+        objective,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
