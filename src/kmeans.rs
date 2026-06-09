@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 
-use matrixmultiply::sgemm;
+use faer::linalg::matmul::matmul;
+use faer::mat::{MatMut, MatRef};
+use faer::{Accum, Par};
 use rand::prelude::*;
 use rand::seq::SliceRandom;
 use rand::RngCore;
@@ -449,92 +451,67 @@ fn assign_points_for_update(
     let rows = norms.len();
     let num_chunks = rows.div_ceil(decode_block_size);
 
-    // fold+reduce: each thread maintains its own state with reusable buffer
-    let mut state = (0..num_chunks)
-        .into_par_iter()
-        .fold(
-            || ThreadLocalState::new(k, dim),
-            |mut state, chunk_idx| {
-                let start = chunk_idx * decode_block_size;
-                let end = ((chunk_idx + 1) * decode_block_size).min(rows);
-                let len = end - start;
-                let data_chunk = &data[start * dim..end * dim];
-                let norms_chunk = &norms[start..end];
+    // Sequential chunks with a single shared GEMM buffer (~512 MB).
+    // faer::matmul(Par::rayon(0)) uses all cores internally — no need for
+    // outer rayon parallelism that would duplicate the buffer.
+    let mut state = ThreadLocalState::new(k, dim);
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * decode_block_size;
+        let end = ((chunk_idx + 1) * decode_block_size).min(rows);
+        let len = end - start;
+        let data_chunk = &data[start * dim..end * dim];
+        let norms_chunk = &norms[start..end];
 
-                // Resize buffer for this chunk
-                state.buffer.resize_for_chunk(len, k, dim);
+        // GEMM via faer (multi-threaded, all cores)
+        state.buffer.resize_for_chunk(len, k, dim);
+        {
+            let a = MatRef::from_row_major_slice(data_chunk, len, dim);
+            let b = MatRef::from_row_major_slice(centroid_col, dim, k);
+            let mut c = MatMut::from_row_major_slice_mut(
+                &mut state.buffer.dot_products, len, k,
+            );
+            matmul(c, Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        }
 
-                // Compute GEMM: dot_products = data_chunk @ centroids^T
-                unsafe {
-                    sgemm(
-                        len,
-                        dim,
-                        k,
-                        1.0,
-                        data_chunk.as_ptr(),
-                        dim as isize,
-                        1,
-                        centroid_col.as_ptr(),
-                        k as isize,
-                        1,
-                        0.0,
-                        state.buffer.dot_products.as_mut_ptr(),
-                        k as isize,
-                        1,
-                    );
-                }
-
-                // Compute assignments and accumulate into state
-                let mut chunk_assignments = Vec::with_capacity(len);
-                let mut chunk_candidates: Vec<(f32, usize)> = Vec::new();
-
-                for row in 0..len {
-                    let norm = norms_chunk[row];
-                    let mut best_cluster = 0usize;
-                    let mut best_distance = f32::INFINITY;
-
-                    #[allow(clippy::needless_range_loop)]
-                    for cluster in 0..k {
-                        let dot = state.buffer.dot_products[row * k + cluster];
-                        let mut distance = norm + centroid_norms[cluster] - 2.0 * dot;
-                        if distance < 0.0 {
-                            distance = 0.0;
-                        }
-                        if distance < best_distance {
-                            best_distance = distance;
-                            best_cluster = cluster;
-                        }
+        // Parallel argmin + accumulation (rayon, read-only on dot_products)
+        let chunk_results: Vec<(usize, f32)> = (0..len)
+            .into_par_iter()
+            .map(|row| {
+                let dot_row = &state.buffer.dot_products[row * k..(row + 1) * k];
+                let norm = norms_chunk[row];
+                let mut best_cluster = 0usize;
+                let mut best_distance = f32::INFINITY;
+                for cluster in 0..k {
+                    let dot = dot_row[cluster];
+                    let mut distance = norm + centroid_norms[cluster] - 2.0 * dot;
+                    if distance < 0.0 { distance = 0.0; }
+                    if distance < best_distance {
+                        best_distance = distance;
+                        best_cluster = cluster;
                     }
-
-                    chunk_assignments.push(best_cluster);
-                    state.counts[best_cluster] += 1;
-
-                    let vector = &data_chunk[row * dim..(row + 1) * dim];
-                    let sum_offset = best_cluster * dim;
-                    #[allow(clippy::needless_range_loop)]
-                    for d in 0..dim {
-                        state.sums[sum_offset + d] += vector[d];
-                    }
-
-                    insert_candidate(&mut chunk_candidates, (best_distance, row));
                 }
+                (best_cluster, best_distance)
+            })
+            .collect();
 
-                // Convert local candidates to global indices
-                for (dist, local_idx) in chunk_candidates {
-                    state.candidates.push((dist, start + local_idx));
-                }
-
-                state.assignments.push((start, chunk_assignments));
-                state
-            },
-        )
-        .reduce(
-            || ThreadLocalState::new(k, dim),
-            |mut a, b| {
-                a.merge_from(b, k, dim);
-                a
-            },
-        );
+        // Sequential accumulation (O(len × dim), fast)
+        let mut chunk_assignments = Vec::with_capacity(len);
+        let mut chunk_candidates: Vec<(f32, usize)> = Vec::new();
+        for (row, &(cluster, dist)) in chunk_results.iter().enumerate() {
+            chunk_assignments.push(cluster);
+            state.counts[cluster] += 1;
+            let vector = &data_chunk[row * dim..(row + 1) * dim];
+            let sum_offset = cluster * dim;
+            for d in 0..dim {
+                state.sums[sum_offset + d] += vector[d];
+            }
+            insert_candidate(&mut chunk_candidates, (dist, row));
+        }
+        for (dist, local_idx) in chunk_candidates {
+            state.candidates.push((dist, start + local_idx));
+        }
+        state.assignments.push((start, chunk_assignments));
+    }
 
     // Write assignments back
     state.assignments.sort_unstable_by_key(|(start, _)| *start);
@@ -612,30 +589,24 @@ fn assign_full_dataset(
 ) -> Vec<usize> {
     let rows = norms.len();
     let num_chunks = rows.div_ceil(decode_block_size);
-    let results: Vec<(usize, Vec<usize>)> = (0..num_chunks)
-        .into_par_iter()
-        .map(|chunk_idx| {
-            let start = chunk_idx * decode_block_size;
-            let end = ((chunk_idx + 1) * decode_block_size).min(rows);
-            let len = end - start;
-            let data_chunk = &data[start * dim..end * dim];
-            let norms_chunk = &norms[start..end];
-            let assignments = compute_chunk_assignments_only(
-                data_chunk,
-                norms_chunk,
-                len,
-                k,
-                dim,
-                centroid_col,
-                centroid_norms,
-            );
-            (start, assignments)
-        })
-        .collect();
-
     let mut assignments = vec![0usize; rows];
-    for (start, chunk_assignments) in results {
-        let end = start + chunk_assignments.len();
+    // Sequential: each chunk allocates dot_products (len×k×4 B); parallel
+    // map would keep multiple such buffers alive simultaneously.
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * decode_block_size;
+        let end = ((chunk_idx + 1) * decode_block_size).min(rows);
+        let len = end - start;
+        let data_chunk = &data[start * dim..end * dim];
+        let norms_chunk = &norms[start..end];
+        let chunk_assignments = compute_chunk_assignments_only(
+            data_chunk,
+            norms_chunk,
+            len,
+            k,
+            dim,
+            centroid_col,
+            centroid_norms,
+        );
         assignments[start..end].copy_from_slice(&chunk_assignments);
     }
     assignments
@@ -652,43 +623,33 @@ fn compute_chunk_assignments_only(
     centroid_norms: &[f32],
 ) -> Vec<usize> {
     let mut dot_products = vec![0.0f32; len * k];
-    unsafe {
-        sgemm(
-            len,
-            dim,
-            k,
-            1.0,
-            data_chunk.as_ptr(),
-            dim as isize,
-            1,
-            centroid_col.as_ptr(),
-            k as isize,
-            1,
-            0.0,
-            dot_products.as_mut_ptr(),
-            k as isize,
-            1,
-        );
+    {
+        let a = MatRef::from_row_major_slice(data_chunk, len, dim);
+        let b = MatRef::from_row_major_slice(centroid_col, dim, k);
+        let mut c = MatMut::from_row_major_slice_mut(&mut dot_products, len, k);
+        matmul(c, Accum::Replace, a, b, 1.0f32, Par::rayon(0));
     }
 
-    let mut assignments = Vec::with_capacity(len);
-    for row in 0..len {
-        let norm = norms_chunk[row];
-        let mut best_cluster = 0usize;
-        let mut best_distance = f32::INFINITY;
-        for cluster in 0..k {
-            let dot = dot_products[row * k + cluster];
-            let mut distance = norm + centroid_norms[cluster] - 2.0 * dot;
-            if distance < 0.0 {
-                distance = 0.0;
+    // Parallel argmin: read-only on dot_products after sgemm
+    let assignments: Vec<usize> = (0..len)
+        .into_par_iter()
+        .map(|row| {
+            let dot_row = &dot_products[row * k..(row + 1) * k];
+            let norm = norms_chunk[row];
+            let mut best_cluster = 0usize;
+            let mut best_distance = f32::INFINITY;
+            for cluster in 0..k {
+                let dot = dot_row[cluster];
+                let mut distance = norm + centroid_norms[cluster] - 2.0 * dot;
+                if distance < 0.0 { distance = 0.0; }
+                if distance < best_distance {
+                    best_distance = distance;
+                    best_cluster = cluster;
+                }
             }
-            if distance < best_distance {
-                best_distance = distance;
-                best_cluster = cluster;
-            }
-        }
-        assignments.push(best_cluster);
-    }
+            best_cluster
+        })
+        .collect();
     assignments
 }
 

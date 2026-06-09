@@ -15,10 +15,14 @@
 
 use std::sync::Arc;
 use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
 use rabitq_rs::io::{read_fvecs, read_groundtruth};
 use rabitq_rs::{IvfRabitqIndex, SearchParams};
 use std::path::PathBuf;
 use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StoreType { Fs, S3 }
 
 #[derive(Debug)]
 struct BenchArgs {
@@ -27,6 +31,35 @@ struct BenchArgs {
     gt: PathBuf,
     topk: usize,
     v4: bool,
+    store_type: StoreType,
+    s3_endpoint: String,
+    s3_bucket: String,
+    s3_access_key: String,
+    s3_secret_key: String,
+}
+
+fn create_v4_store(args: &BenchArgs) -> Arc<dyn ObjectStore> {
+    match args.store_type {
+        StoreType::Fs => {
+            let _ = std::fs::create_dir_all(&args.index);
+            Arc::new(LocalFileSystem::new_with_prefix(&args.index).expect("LocalFileSystem"))
+        }
+        StoreType::S3 => {
+            use object_store::aws::AmazonS3Builder;
+            use object_store::prefix::PrefixStore;
+
+            let prefix = args.index.to_string_lossy().to_string();
+            let s3 = AmazonS3Builder::new()
+                .with_endpoint(&args.s3_endpoint)
+                .with_access_key_id(&args.s3_access_key)
+                .with_secret_access_key(&args.s3_secret_key)
+                .with_bucket_name(&args.s3_bucket)
+                .with_allow_http(true)
+                .build()
+                .expect("Failed to create S3 store");
+            Arc::new(PrefixStore::new(s3, prefix))
+        }
+    }
 }
 
 fn parse_args() -> Result<BenchArgs, Box<dyn std::error::Error>> {
@@ -36,33 +69,26 @@ fn parse_args() -> Result<BenchArgs, Box<dyn std::error::Error>> {
     let mut gt = None;
     let mut topk = 100usize;
     let mut v4 = false;
+    let mut store_type = StoreType::Fs;
+    let mut s3_endpoint = "http://localhost:9000".to_string();
+    let mut s3_bucket = String::new();
+    let mut s3_access_key = "minioadmin1".to_string();
+    let mut s3_secret_key = "minioadmin1".to_string();
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--index" => {
-                i += 1;
-                index = Some(PathBuf::from(&args[i]));
-            }
-            "--queries" => {
-                i += 1;
-                queries = Some(PathBuf::from(&args[i]));
-            }
-            "--gt" => {
-                i += 1;
-                gt = Some(PathBuf::from(&args[i]));
-            }
-            "--topk" => {
-                i += 1;
-                topk = args[i].parse()?;
-            }
-            "--v4" => {
-                v4 = true;
-            }
-            other => {
-                eprintln!("unknown argument: {other}");
-                std::process::exit(1);
-            }
+            "--index" => { i += 1; index = Some(PathBuf::from(&args[i])); }
+            "--queries" => { i += 1; queries = Some(PathBuf::from(&args[i])); }
+            "--gt" => { i += 1; gt = Some(PathBuf::from(&args[i])); }
+            "--topk" => { i += 1; topk = args[i].parse()?; }
+            "--v4" => { v4 = true; }
+            "--store" => { i += 1; store_type = match args[i].as_str() { "fs"=>StoreType::Fs, "s3"=>StoreType::S3, o=>{eprintln!("unknown store: {o}");std::process::exit(1);}}; }
+            "--s3-endpoint" => { i += 1; s3_endpoint = args[i].clone(); }
+            "--s3-bucket" => { i += 1; s3_bucket = args[i].clone(); }
+            "--s3-access-key" => { i += 1; s3_access_key = args[i].clone(); }
+            "--s3-secret-key" => { i += 1; s3_secret_key = args[i].clone(); }
+            other => { eprintln!("unknown argument: {other}"); std::process::exit(1); }
         }
         i += 1;
     }
@@ -73,6 +99,11 @@ fn parse_args() -> Result<BenchArgs, Box<dyn std::error::Error>> {
         gt: gt.ok_or("--gt <path> is required")?,
         topk,
         v4,
+        store_type,
+        s3_endpoint,
+        s3_bucket,
+        s3_access_key,
+        s3_secret_key,
     })
 }
 
@@ -90,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading index from {}...", args.index.display());
     let t0 = Instant::now();
     let index = if args.v4 {
-        let store = Arc::new(LocalFileSystem::new_with_prefix(&args.index).expect("LocalFileSystem"));
+        let store = create_v4_store(&args);
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(IvfRabitqIndex::load_from_v4(store))?
     } else {

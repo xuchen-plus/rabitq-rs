@@ -1,4 +1,13 @@
 //! V4 Manifest + Segment persistence on `object_store`.
+//!
+//! ## Manifest versions
+//!
+//! | Version | Introduced | Description |
+//! |---------|-----------|-------------|
+//! | 1       | initial   | Single segment per cluster |
+//! | 2       | delta-seg | Multiple (base + delta) segments per cluster |
+//!
+//! V2 is always written; V1 can still be read (auto-upgraded on next write).
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
@@ -10,7 +19,7 @@ use object_store::path::Path as StorePath;
 use crate::{Metric, RabitqError, RotatorType};
 
 pub const V4_MANIFEST_MAGIC: [u8; 4] = *b"RBQ3";
-pub const V4_MANIFEST_VERSION: u32 = 1;
+pub const V4_MANIFEST_VERSION: u32 = 2; // delta-segment support
 pub const V4_SEGMENT_MAGIC: [u8; 4] = *b"SEG1";
 pub const MANIFEST_FILENAME: &str = "manifest.bin";
 
@@ -31,7 +40,14 @@ macro_rules! wle {
 }
 
 macro_rules! hup {
-    ($h:expr, $d:expr) => { if let Some(h) = $h { h.update($d); } };
+    ($h:expr, $d:expr) => { if let Some(ref mut h) = $h { h.update($d); } };
+}
+
+/// Apply a closure to the hasher reference if present.
+/// Avoids moving the `Option<&mut Hasher>` so it can be reused.
+#[inline]
+fn hup_ref(h: &mut Option<&mut Hasher>, data: &[u8]) {
+    if let Some(ref mut hasher) = h { hasher.update(data); }
 }
 
 // ---- conversions ----
@@ -51,14 +67,45 @@ fn os_err(e: object_store::Error) -> RabitqError {
 
 // ---- types ----
 
+/// One segment file belonging to a cluster.
 #[derive(Debug, Clone)]
-pub struct ClusterManifestEntry {
-    pub cluster_id: u32,
+pub struct SegmentManifestEntry {
     pub segment_filename: String,
-    pub segment_version: u32,
+    pub segment_version: u32, // 0 = base, 1+ = delta
     pub num_vectors: u32,
     pub file_size: u64,
 }
+
+/// Per-cluster entry in the manifest.  A cluster has one *base* segment
+/// (version 0, written at initial build time) and zero or more *delta*
+/// segments (version 1+, written by incremental flush).  All segments
+/// are immutable once written.
+#[derive(Debug, Clone)]
+pub struct ClusterManifestEntry {
+    pub cluster_id: u32,
+    pub segments: Vec<SegmentManifestEntry>,
+}
+
+impl ClusterManifestEntry {
+    /// Total vectors across all segments of this cluster.
+    pub fn total_vectors(&self) -> usize {
+        self.segments.iter().map(|s| s.num_vectors as usize).sum()
+    }
+
+    /// Highest segment version (used to generate the next version number).
+    pub fn latest_version(&self) -> u32 {
+        self.segments.iter().map(|s| s.segment_version).max().unwrap_or(0)
+    }
+
+    /// The base segment (version 0).  Its centroid is the canonical
+    /// centroid for the cluster.
+    pub fn base_segment(&self) -> Option<&SegmentManifestEntry> {
+        self.segments.iter().find(|s| s.segment_version == 0)
+    }
+}
+
+// Backward-compat aliases used by ivf.rs call-sites that reference the
+// old flat fields.  These will be cleaned up in the ivf.rs update.
 
 #[derive(Debug, Clone)]
 pub struct ManifestHeader {
@@ -82,7 +129,26 @@ pub struct ClusterSegmentData {
     pub vl: Vec<f32>,
 }
 
-// ---- manifest read/write ----
+// ---- manifest read ----
+
+/// Read a single segment entry from the manifest cursor (V2 format).
+/// Returns (segment_filename, segment_version, num_vectors, file_size).
+fn read_segment_entry<R: Read>(r: &mut R, h: &mut Option<&mut Hasher>) -> Result<SegmentManifestEntry, RabitqError> {
+    let sv = rle!(r, u32);
+    hup_ref(h, &sv.to_le_bytes());
+    let nv = rle!(r, u32);
+    hup_ref(h, &nv.to_le_bytes());
+    let fs = rle!(r, u64);
+    hup_ref(h, &fs.to_le_bytes());
+    let fl = rle!(r, u32) as usize;
+    hup_ref(h, &(fl as u32).to_le_bytes());
+    let mut fb = vec![0u8; fl];
+    r.read_exact(&mut fb)?;
+    hup_ref(h, &fb);
+    let fname = String::from_utf8(fb)
+        .map_err(|_| RabitqError::InvalidPersistence("non-UTF8 filename"))?;
+    Ok(SegmentManifestEntry { segment_filename: fname, segment_version: sv, num_vectors: nv, file_size: fs })
+}
 
 pub async fn load_manifest(
     store: &dyn ObjectStore,
@@ -93,40 +159,76 @@ pub async fn load_manifest(
     let mut r = Cursor::new(bytes.as_ref());
 
     let mut magic = [0u8; 4]; r.read_exact(&mut magic)?;
-    if magic != V4_MANIFEST_MAGIC { return Err(RabitqError::InvalidPersistence("not a V4 manifest")); }
+    if magic != V4_MANIFEST_MAGIC {
+        return Err(RabitqError::InvalidPersistence("not a V4 manifest"));
+    }
     let version = rle!(r, u32);
-    if version != V4_MANIFEST_VERSION { return Err(RabitqError::InvalidPersistence("unsupported manifest version")); }
+    if version != 1 && version != V4_MANIFEST_VERSION {
+        return Err(RabitqError::InvalidPersistence("unsupported manifest version"));
+    }
 
     let mut h = Hasher::new();
-    let dim = rle!(r, u32) as usize;   hup!(Some(&mut h), &(dim as u32).to_le_bytes());
-    let pd = rle!(r, u32) as usize;    hup!(Some(&mut h), &(pd as u32).to_le_bytes());
-    let mtag = rle!(r, u8);            hup!(Some(&mut h), &[mtag]);
-    let rtag = rle!(r, u8);            hup!(Some(&mut h), &[rtag]);
-    let eb = rle!(r, u8) as usize;     hup!(Some(&mut h), &[eb as u8]);
-    let tb = rle!(r, u8) as usize;     hup!(Some(&mut h), &[tb as u8]);
-    let _tv = rle!(r, u64);            hup!(Some(&mut h), &0u64.to_le_bytes()); // placeholder
-    let rdl = uf64(rle!(r, u64))?;     hup!(Some(&mut h), &(rdl as u64).to_le_bytes()); // already fine, just confirming
+    let dim = rle!(r, u32) as usize;     hup!(Some(&mut h), &(dim as u32).to_le_bytes());
+    let pd = rle!(r, u32) as usize;      hup!(Some(&mut h), &(pd as u32).to_le_bytes());
+    let mtag = rle!(r, u8);              hup!(Some(&mut h), &[mtag]);
+    let rtag = rle!(r, u8);              hup!(Some(&mut h), &[rtag]);
+    let eb = rle!(r, u8) as usize;       hup!(Some(&mut h), &[eb as u8]);
+    let tb = rle!(r, u8) as usize;       hup!(Some(&mut h), &[tb as u8]);
+    let _tv = rle!(r, u64);              hup!(Some(&mut h), &0u64.to_le_bytes());
+    let rdl = uf64(rle!(r, u64))?;       hup!(Some(&mut h), &(rdl as u64).to_le_bytes());
     let mut rd = vec![0u8; rdl]; r.read_exact(&mut rd)?; h.update(&rd);
 
-    let cc = rle!(r, u32) as usize;    hup!(Some(&mut h), &(cc as u32).to_le_bytes());
+    let cc = rle!(r, u32) as usize;      hup!(Some(&mut h), &(cc as u32).to_le_bytes());
     let mut map: BTreeMap<u32, ClusterManifestEntry> = BTreeMap::new();
-    for _ in 0..cc {
-        let cid = rle!(r, u32);        hup!(Some(&mut h), &cid.to_le_bytes());
-        let sv = rle!(r, u32);         hup!(Some(&mut h), &sv.to_le_bytes());
-        let nv = rle!(r, u32);         hup!(Some(&mut h), &nv.to_le_bytes());
-        let fs = rle!(r, u64);         hup!(Some(&mut h), &fs.to_le_bytes());
-        let fl = rle!(r, u32) as usize; hup!(Some(&mut h), &(fl as u32).to_le_bytes());
-        let mut fb = vec![0u8; fl]; r.read_exact(&mut fb)?; h.update(&fb);
-        let fname = String::from_utf8(fb).map_err(|_| RabitqError::InvalidPersistence("non-UTF8 filename"))?;
-        map.insert(cid, ClusterManifestEntry { cluster_id:cid, segment_filename:fname, segment_version:sv, num_vectors:nv, file_size:fs });
-    }
+
+    {
+        // Scope for h_opt: we need a persistent &mut Option<&mut Hasher> so
+        // read_segment_entry can be called multiple times without moving it.
+        let mut h_opt: Option<&mut Hasher> = Some(&mut h);
+        if version == 1 {
+            // V1: one segment per cluster
+            for _ in 0..cc {
+                let cid = rle!(r, u32); hup!(h_opt, &cid.to_le_bytes());
+                let seg = read_segment_entry(&mut r, &mut h_opt)?;
+                map.insert(cid, ClusterManifestEntry {
+                    cluster_id: cid,
+                    segments: vec![seg],
+                });
+            }
+        } else {
+            // V2+: segment_count per cluster
+            for _ in 0..cc {
+                let cid = rle!(r, u32); hup!(h_opt, &cid.to_le_bytes());
+                let sc = rle!(r, u32) as usize; hup!(h_opt, &(sc as u32).to_le_bytes());
+                let mut segments = Vec::with_capacity(sc);
+                for _ in 0..sc {
+                    segments.push(read_segment_entry(&mut r, &mut h_opt)?);
+                }
+                map.insert(cid, ClusterManifestEntry { cluster_id: cid, segments });
+            }
+        }
+    } // h_opt dropped — h is usable again
+
     let computed = h.finalize();
     let stored = rle!(r, u32);
-    if computed != stored { return Err(RabitqError::InvalidPersistence("manifest checksum mismatch")); }
+    if computed != stored {
+        return Err(RabitqError::InvalidPersistence("manifest checksum mismatch"));
+    }
 
     let metric = tm(mtag).ok_or(RabitqError::InvalidPersistence("unknown metric tag"))?;
     let rotator_type = RotatorType::from_u8(rtag).ok_or(RabitqError::InvalidPersistence("unknown rotator type"))?;
     Ok((ManifestHeader { dim, padded_dim: pd, metric, rotator_type, rotator_data: rd, ex_bits: eb, total_bits: tb }, map))
+}
+
+// ---- manifest write (always V2) ----
+
+fn write_segment_entry(w: &mut Vec<u8>, h: &mut Option<&mut Hasher>, seg: &SegmentManifestEntry) {
+    wle!(w, seg.segment_version, u32);  hup_ref(h, &seg.segment_version.to_le_bytes());
+    wle!(w, seg.num_vectors, u32);      hup_ref(h, &seg.num_vectors.to_le_bytes());
+    wle!(w, seg.file_size, u64);        hup_ref(h, &seg.file_size.to_le_bytes());
+    let fb = seg.segment_filename.as_bytes();
+    wle!(w, fb.len(), u32);             hup_ref(h, &(fb.len() as u32).to_le_bytes());
+    w.write_all(fb).unwrap();            hup_ref(h, fb);
 }
 
 pub async fn save_manifest(
@@ -150,15 +252,17 @@ pub async fn save_manifest(
     b.write_all(&header.rotator_data).unwrap(); h.update(&header.rotator_data);
     wle!(b, cluster_map.len(), u32); hup!(Some(&mut h), &(cluster_map.len() as u32).to_le_bytes());
 
-    for e in cluster_map.values() {
-        wle!(b, e.cluster_id, u32);      hup!(Some(&mut h), &e.cluster_id.to_le_bytes());
-        wle!(b, e.segment_version, u32); hup!(Some(&mut h), &e.segment_version.to_le_bytes());
-        wle!(b, e.num_vectors, u32);     hup!(Some(&mut h), &e.num_vectors.to_le_bytes());
-        wle!(b, e.file_size, u64);       hup!(Some(&mut h), &e.file_size.to_le_bytes());
-        let fb = e.segment_filename.as_bytes();
-        wle!(b, fb.len(), u32); hup!(Some(&mut h), &(fb.len() as u32).to_le_bytes());
-        b.write_all(fb).unwrap(); h.update(fb);
-    }
+    // V2 format: segment_count per cluster
+    {
+        let mut h_opt: Option<&mut Hasher> = Some(&mut h);
+        for e in cluster_map.values() {
+            wle!(b, e.cluster_id, u32); hup!(h_opt, &e.cluster_id.to_le_bytes());
+            wle!(b, e.segments.len(), u32); hup!(h_opt, &(e.segments.len() as u32).to_le_bytes());
+            for seg in &e.segments {
+                write_segment_entry(&mut b, &mut h_opt, seg);
+            }
+        }
+    } // h_opt dropped — h is usable again
     wle!(b, h.finalize(), u32);
 
     let key = StorePath::from(MANIFEST_FILENAME);
@@ -218,15 +322,30 @@ pub async fn read_segment_full(
     Ok(ClusterSegmentData { cluster_id, centroid, padded_dim: pd, ex_bits: eb, ids, batch_data, ex_codes_packed, f_add_ex, f_rescale_ex, delta, vl })
 }
 
-// ---- segment read (centroid only) ----
+// ---- segment read (centroid only, range request) ----
 
+/// Read only the centroid from a segment file using a byte-range request.
+///
+/// Segment layout prefix:
+///   [0..4)   magic
+///   [4..8)   cluster_id u32
+///   [8..12)  segment_version u32
+///   [12..16) padded_dim u32
+///   [16]     ex_bits u8
+///   [17..21) num_vectors u32
+///   [21..21+pd*4) centroid
+///
+/// Only bytes [0..21+pd*4) are fetched.  For a typical 960-dim cluster this is
+/// ~3.8 KB instead of downloading the whole segment (hundreds of KB or more).
 pub async fn read_segment_centroid(
     store: &dyn ObjectStore, key: &str, padded_dim: usize,
 ) -> Result<(u32, Vec<f32>), RabitqError> {
-    let result = store.get(&StorePath::from(key)).await.map_err(os_err)?;
-    let bytes = result.bytes().await.map_err(os_err)?;
-    let b = bytes.as_ref();
-    if b.len() < 21 + padded_dim * 4 { return Err(RabitqError::InvalidPersistence("segment too short")); }
+    let centroid_end = (21 + padded_dim * 4) as u64;
+    let result = store.get_range(&StorePath::from(key), 0..centroid_end).await.map_err(os_err)?;
+    let b = result.as_ref();
+    if b.len() < centroid_end as usize {
+        return Err(RabitqError::InvalidPersistence("segment too short for centroid range"));
+    }
     let cluster_id = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
     let mut centroid = vec![0.0f32; padded_dim];
     for i in 0..padded_dim {

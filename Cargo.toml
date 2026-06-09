@@ -12,7 +12,7 @@ keywords = ["ann", "vector-search", "quantization", "ivf", "similarity"]
 categories = ["algorithms", "science"]
 
 [dependencies]
-matrixmultiply = "0.3"
+faer = { version = "0.24", default-features = false, features = ["linalg", "rayon"] }
 rayon = "1.8"
 rand = { version = "0.8", features = ["std"] }
 rand_distr = "0.4"
@@ -23,7 +23,7 @@ roaring = "0.10"
 libc = "0.2"
 
 # Object store for S3-compatible persistence
-object_store = { version = "0.13", default-features = false, features = ["fs"] }
+object_store = { version = "0.13", default-features = false, features = ["fs", "aws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
 
