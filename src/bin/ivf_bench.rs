@@ -13,6 +13,8 @@
 ///   5      | 12500   | 0.452
 ///   ...
 
+use std::sync::Arc;
+use object_store::local::LocalFileSystem;
 use rabitq_rs::io::{read_fvecs, read_groundtruth};
 use rabitq_rs::{IvfRabitqIndex, SearchParams};
 use std::path::PathBuf;
@@ -88,7 +90,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading index from {}...", args.index.display());
     let t0 = Instant::now();
     let index = if args.v4 {
-        IvfRabitqIndex::load_from_v4_dir(&args.index)?
+        let store = Arc::new(LocalFileSystem::new_with_prefix(&args.index).expect("LocalFileSystem"));
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(IvfRabitqIndex::load_from_v4(store))?
     } else {
         IvfRabitqIndex::load_from_path(&args.index)?
     };

@@ -2,11 +2,12 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
 use std::fs::File;
-use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use crc32fast::Hasher;
+use object_store::ObjectStore;
 
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -939,6 +940,258 @@ pub struct IvfRabitqIndex {
     ip_func: crate::simd::ExIpFunc,
 }
 
+// ========================================================================
+// Unified builder: insert_batch → build → flush
+// ========================================================================
+//
+// Two modes:
+//   Fresh (new from scratch):   builder.new() → insert_batch × N → build() → flush()
+//   Loaded (incremental):       builder.load(dir) → insert_batch × N → build() → flush()
+//
+// In fresh mode, insert_batch does reservoir sampling.
+// In loaded mode, insert_batch rotates + quantises + appends to clusters.
+
+enum BuilderState {
+    Fresh {
+        dim: usize,
+        nlist: usize,
+        total_bits: usize,
+        metric: Metric,
+        rotator_type: RotatorType,
+        seed: u64,
+        use_faster_config: bool,
+        padded_dim: usize,
+        ex_bits: usize,
+        reservoir: Vec<f32>,
+        reservoir_capacity: usize,
+        reservoir_count: usize,
+        reservoir_seen: usize,
+    },
+    Loaded {
+        index: IvfRabitqIndex,
+    },
+}
+
+pub struct IvfRabitqBuilder {
+    state: BuilderState,
+}
+
+impl IvfRabitqBuilder {
+    /// Load from an object store, or initialise a fresh builder if no
+    /// `manifest.bin` exists.
+    ///
+    /// - **Fresh**: no manifest → `insert_batch` reservoir-samples; `build`
+    ///   runs k-means + streaming quantisation.
+    /// - **Loaded**: manifest exists → reads centroids only from segments;
+    ///   `insert_batch` appends vectors directly; `build` flushes pending.
+    pub async fn load(
+        store: Arc<dyn ObjectStore>,
+        dim: usize, nlist: usize, total_bits: usize,
+        metric: Metric, rotator_type: RotatorType, seed: u64, use_faster_config: bool,
+    ) -> Result<Self, RabitqError> {
+        if crate::manifest::manifest_exists(&*store).await {
+            let (header, cluster_map) = crate::manifest::load_manifest(&*store).await?;
+            let mut clusters = Vec::with_capacity(cluster_map.len());
+            for (_cid, entry) in cluster_map.iter() {
+                let (_, centroid) = crate::manifest::read_segment_centroid(
+                    &*store, &entry.segment_filename, header.padded_dim,
+                ).await?;
+                clusters.push(ClusterData {
+                    centroid,
+                    ids: Vec::new(), batch_data: Vec::new(),
+                    ex_codes_packed: Vec::new(), f_add_ex: Vec::new(), f_rescale_ex: Vec::new(),
+                    delta: Vec::new(), vl: Vec::new(), num_vectors: 0,
+                    padded_dim: header.padded_dim, ex_bits: header.ex_bits,
+                    pending_ids: Vec::new(), pending_vectors: Vec::new(),
+                });
+            }
+            let rotator = DynamicRotator::deserialize(
+                header.dim, header.padded_dim, header.rotator_type, &header.rotator_data,
+            )?;
+            let ip_func = crate::simd::select_excode_ipfunc(header.ex_bits);
+            let index = IvfRabitqIndex {
+                dim: header.dim, padded_dim: header.padded_dim, metric: header.metric,
+                rotator, clusters, ex_bits: header.ex_bits, ip_func,
+            };
+            return Ok(Self { state: BuilderState::Loaded { index } });
+        }
+
+        let rotator = DynamicRotator::new(dim, rotator_type, seed);
+        let reservoir_capacity = nlist * 64;
+        Ok(Self {
+            state: BuilderState::Fresh {
+                dim, nlist, total_bits, metric, rotator_type, seed, use_faster_config,
+                padded_dim: rotator.padded_dim(),
+                ex_bits: total_bits.saturating_sub(1),
+                reservoir: Vec::with_capacity(reservoir_capacity * dim),
+                reservoir_capacity,
+                reservoir_count: 0,
+                reservoir_seen: 0,
+            },
+        })
+    }
+
+    /// Push one flat batch `[n * dim]` into the builder.
+    ///
+    /// - **Fresh mode**: reservoir-samples vectors for k-means, drops batch.
+    /// - **Loaded mode**: rotates, finds centroids, quantises, appends to
+    ///   cluster pending buffers, drops batch.
+    pub fn insert_batch(&mut self, batch: Vec<f32>) -> Result<(), RabitqError> {
+        match &mut self.state {
+            BuilderState::Fresh { dim, reservoir, reservoir_capacity, reservoir_count, reservoir_seen, seed, .. } => {
+                let d = *dim;
+                let n = batch.len() / d;
+                let cap = *reservoir_capacity;
+                let mut rng = StdRng::seed_from_u64(seed.wrapping_add(*reservoir_seen as u64));
+                for i in 0..n {
+                    let v = &batch[i * d..(i + 1) * d];
+                    if *reservoir_count < cap {
+                        reservoir.extend_from_slice(v);
+                        *reservoir_count += 1;
+                    } else {
+                        let j = rng.gen_range(0..*reservoir_seen + i + 1);
+                        if j < cap {
+                            let dst = j * d;
+                            reservoir[dst..dst + d].copy_from_slice(v);
+                        }
+                    }
+                }
+                *reservoir_seen += n;
+                // batch dropped
+                Ok(())
+            }
+            BuilderState::Loaded { index, .. } => {
+                index.insert_batch(index.len(), batch)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Finalise the builder.
+    ///
+    /// - **Fresh mode**: runs k-means on reservoir samples, then streams
+    ///   `next_batch` to rotate + quantise all vectors.  Returns the built index.
+    /// - **Loaded mode**: flushes pending vectors into batch_data, returns
+    ///   the index for persistence.
+    pub fn build(
+        self,
+        next_batch: Option<&mut impl FnMut() -> Option<Vec<f32>>>,
+    ) -> Result<IvfRabitqIndex, RabitqError> {
+        match self.state {
+            BuilderState::Fresh {
+                dim, nlist, total_bits, metric, rotator_type, seed, use_faster_config,
+                padded_dim, ex_bits,
+                reservoir, reservoir_count, reservoir_seen, ..
+            } => {
+                use crate::kmeans::{run_kmeans_on_flat, KMeansConfig};
+                use rayon::prelude::*;
+
+                let mut next_batch = next_batch
+                    .ok_or_else(|| RabitqError::InvalidConfig("build requires next_batch callback"))?;
+
+                println!("  Reservoir: {} / {} vectors ({:.1} MB)", reservoir_count, reservoir_seen,
+                         reservoir_count * dim * 4 / (1024 * 1024));
+                if reservoir_count == 0 {
+                    return Err(RabitqError::InvalidConfig("no vectors added"));
+                }
+
+                let rotator = DynamicRotator::new(dim, rotator_type, seed);
+
+                // Rotate reservoir sample
+                let rotated_sample: Vec<f32> = {
+                    let mut out = Vec::with_capacity(reservoir_count * padded_dim);
+                    for i in 0..reservoir_count {
+                        let v = &reservoir[i * dim..(i + 1) * dim];
+                        out.extend_from_slice(&rotator.rotate(v));
+                    }
+                    out
+                };
+                drop(reservoir);
+
+                println!("  Training k-means ({} clusters, 15 iterations)...", nlist);
+                let kmeans_config = KMeansConfig {
+                    niter: 15, nredo: 1,
+                    seed: StdRng::seed_from_u64(seed).next_u64(),
+                    spherical: false, max_points_per_centroid: 64,
+                    decode_block_size: 32768,
+                };
+                let KMeansResult { centroids: rotated_centroids, .. } =
+                    run_kmeans_on_flat(&rotated_sample, reservoir_count, padded_dim, nlist, kmeans_config);
+                drop(rotated_sample);
+
+                let config = if use_faster_config { RabitqConfig::faster(padded_dim, total_bits, seed) }
+                             else { RabitqConfig::new(total_bits) };
+                let mut clusters: Vec<ClusterData> = rotated_centroids.iter().map(|c| ClusterData {
+                    centroid: c.clone(), ids: Vec::new(), batch_data: Vec::new(),
+                    ex_codes_packed: Vec::new(), f_add_ex: Vec::new(), f_rescale_ex: Vec::new(),
+                    delta: Vec::new(), vl: Vec::new(), num_vectors: 0,
+                    padded_dim, ex_bits, pending_ids: Vec::new(), pending_vectors: Vec::new(),
+                }).collect();
+
+                let centroid_col: Vec<f32> = {
+                    let mut col = vec![0.0f32; padded_dim * nlist];
+                    for (cid, c) in rotated_centroids.iter().enumerate() {
+                        for d in 0..padded_dim { col[d * nlist + cid] = c[d]; }
+                    }
+                    col
+                };
+                let centroid_norms: Vec<f32> = rotated_centroids.iter().map(|c| c.iter().map(|x| x*x).sum()).collect();
+
+                println!("  Streaming rotation + quantisation...");
+                let mut global_id: usize = 0;
+                let mut bc: usize = 0;
+                while let Some(batch) = next_batch() {
+                    let bn = batch.len() / dim; bc += 1;
+                    let rb: Vec<f32> = {
+                        let mut out = Vec::with_capacity(bn * padded_dim);
+                        for i in 0..bn {
+                            let v = &batch[i * dim..(i + 1) * dim];
+                            out.extend_from_slice(&rotator.rotate(v));
+                        }
+                        out
+                    };
+                    drop(batch);
+                    let bids = assign_batch_to_centroids(&rb, bn, nlist, padded_dim, &centroid_col, &centroid_norms);
+                    let ins: Vec<(usize, QuantizedVector)> = (0..bn).into_par_iter().map(|i| {
+                        let rv = &rb[i * padded_dim..(i + 1) * padded_dim];
+                        let cid = bids[i];
+                        (cid, crate::quantizer::quantize_with_centroid(rv, &clusters[cid].centroid, &config, metric))
+                    }).collect();
+                    drop(rb);
+                    for (i, (cid, q)) in ins.into_iter().enumerate() { clusters[cid].append_vector(global_id + i, q); }
+                    global_id += bn;
+                    if bc.is_multiple_of(10) { println!("    {} vectors...", global_id); }
+                }
+                for c in &mut clusters { c.flush_pending(); }
+                println!("  Build complete: {} vectors, {} clusters", global_id, clusters.len());
+                let ip_func = crate::simd::select_excode_ipfunc(ex_bits);
+                Ok(IvfRabitqIndex { dim, padded_dim, metric, rotator, clusters, ex_bits, ip_func })
+            }
+
+            BuilderState::Loaded { mut index } => {
+                index.flush_all_pending();
+                Ok(index)
+            }
+        }
+    }
+
+    /// Flush the (built or loaded) index to object store.
+    pub async fn flush(
+        self,
+        store: &dyn ObjectStore,
+    ) -> Result<IvfRabitqIndex, RabitqError> {
+        match self.state {
+            BuilderState::Loaded { index } => {
+                index.save_to_v4(store).await?;
+                Ok(index)
+            }
+            BuilderState::Fresh { .. } => {
+                Err(RabitqError::InvalidConfig("call build() before flush() for fresh builder"))
+            }
+        }
+    }
+}
+
 impl IvfRabitqIndex {
     /// Train a new index from the provided dataset.
     pub fn train(
@@ -1364,6 +1617,11 @@ impl IvfRabitqIndex {
     /// Check whether the index is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Original vector dimension (before padding/rotation).
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
     /// Number of IVF clusters maintained by the index.
@@ -2440,24 +2698,16 @@ impl IvfRabitqIndex {
         }
     }
 
-    /// Save the index in V4 format.
-    pub fn save_to_v4_dir<P: AsRef<Path>>(&self, dir: P) -> Result<(), RabitqError> {
+    /// Save the index to object store (async).
+    pub async fn save_to_v4(&self, store: &dyn ObjectStore) -> Result<(), RabitqError> {
         use crate::manifest::{self, ClusterManifestEntry, ClusterSegmentData, ManifestHeader};
-
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
 
         let rotator_type = self.rotator.rotator_type();
         let header = ManifestHeader {
-            dim: self.dim,
-            padded_dim: self.padded_dim,
-            metric: self.metric,
-            rotator_type,
-            rotator_data: self.rotator.serialize(),
-            ex_bits: self.ex_bits,
-            total_bits: self.ex_bits + 1,
+            dim: self.dim, padded_dim: self.padded_dim, metric: self.metric,
+            rotator_type, rotator_data: self.rotator.serialize(),
+            ex_bits: self.ex_bits, total_bits: self.ex_bits + 1,
         };
-
         let mut cluster_map: std::collections::BTreeMap<u32, ClusterManifestEntry> =
             std::collections::BTreeMap::new();
 
@@ -2465,97 +2715,43 @@ impl IvfRabitqIndex {
             let cid = i as u32;
             let version = 0u32;
             let fname = manifest::segment_filename(cid, version);
-            let seg_path = dir.join(&fname);
-
             let seg_data = ClusterSegmentData::from_cluster_data(
-                cid,
-                cluster.centroid.clone(),
-                self.padded_dim,
-                self.ex_bits,
-                cluster.ids.clone(),
-                cluster.batch_data.clone(),
-                cluster.ex_codes_packed.clone(),
-                cluster.f_add_ex.clone(),
-                cluster.f_rescale_ex.clone(),
-                cluster.delta.clone(),
-                cluster.vl.clone(),
+                cid, cluster.centroid.clone(), self.padded_dim, self.ex_bits,
+                cluster.ids.clone(), cluster.batch_data.clone(),
+                cluster.ex_codes_packed.clone(), cluster.f_add_ex.clone(),
+                cluster.f_rescale_ex.clone(), cluster.delta.clone(), cluster.vl.clone(),
             );
-
-            let file_size = manifest::write_segment(&seg_path, &seg_data, version)?;
-
-            cluster_map.insert(
-                cid,
-                ClusterManifestEntry {
-                    cluster_id: cid,
-                    segment_filename: fname,
-                    segment_version: version,
-                    num_vectors: cluster.num_vectors as u32,
-                    file_size,
-                },
-            );
+            let file_size = manifest::write_segment(store, &fname, &seg_data, version).await?;
+            cluster_map.insert(cid, ClusterManifestEntry {
+                cluster_id: cid, segment_filename: fname, segment_version: version,
+                num_vectors: cluster.num_vectors as u32, file_size,
+            });
         }
-
-        manifest::save_manifest(dir, &header, &cluster_map)?;
-        println!(
-            "Saved V4 index: {} clusters, {} segments → {}",
-            self.clusters.len(),
-            cluster_map.len(),
-            dir.display()
-        );
-
+        manifest::save_manifest(store, &header, &cluster_map).await?;
+        println!("Saved V4 index: {} clusters, {} segments", self.clusters.len(), cluster_map.len());
         Ok(())
     }
 
-    /// Load an index from a V4-format directory.
-    pub fn load_from_v4_dir<P: AsRef<Path>>(dir: P) -> Result<Self, RabitqError> {
-        use crate::manifest::{self, read_segment};
-        use crate::rotation::DynamicRotator;
-
-        let dir = dir.as_ref();
-        let (header, cluster_map) = manifest::load_manifest(dir)?;
-
-        let rotator = DynamicRotator::deserialize(
-            header.dim,
-            header.padded_dim,
-            header.rotator_type,
-            &header.rotator_data,
-        )?;
-
-        let cluster_count = cluster_map.len();
-        let mut clusters = Vec::with_capacity(cluster_count);
-
-        for (&_cid, entry) in cluster_map.iter() {
-            let seg_path = dir.join(&entry.segment_filename);
-            let seg = read_segment(&seg_path)?;
-
+    /// Load index from object store (async, full segments for search).
+    pub async fn load_from_v4(store: Arc<dyn ObjectStore>) -> Result<Self, RabitqError> {
+        let (header, cluster_map) = crate::manifest::load_manifest(&*store).await?;
+        let mut clusters = Vec::with_capacity(cluster_map.len());
+        for (_cid, entry) in cluster_map.iter() {
+            let seg = crate::manifest::read_segment_full(&*store, &entry.segment_filename).await?;
             clusters.push(ClusterData {
-                centroid: seg.centroid,
-                ids: seg.ids,
-                batch_data: seg.batch_data,
-                ex_codes_packed: seg.ex_codes_packed,
-                f_add_ex: seg.f_add_ex,
-                f_rescale_ex: seg.f_rescale_ex,
-                delta: seg.delta,
-                vl: seg.vl,
-                num_vectors: entry.num_vectors as usize,
-                padded_dim: header.padded_dim,
-                ex_bits: header.ex_bits,
-                pending_ids: Vec::new(),
-                pending_vectors: Vec::new(),
+                centroid: seg.centroid, ids: seg.ids, batch_data: seg.batch_data,
+                ex_codes_packed: seg.ex_codes_packed, f_add_ex: seg.f_add_ex,
+                f_rescale_ex: seg.f_rescale_ex, delta: seg.delta, vl: seg.vl,
+                num_vectors: entry.num_vectors as usize, padded_dim: header.padded_dim,
+                ex_bits: header.ex_bits, pending_ids: Vec::new(), pending_vectors: Vec::new(),
             });
         }
-
+        let rotator = DynamicRotator::deserialize(
+            header.dim, header.padded_dim, header.rotator_type, &header.rotator_data,
+        )?;
         let ip_func = crate::simd::select_excode_ipfunc(header.ex_bits);
-
-        Ok(Self {
-            dim: header.dim,
-            padded_dim: header.padded_dim,
-            metric: header.metric,
-            rotator,
-            clusters,
-            ex_bits: header.ex_bits,
-            ip_func,
-        })
+        Ok(Self { dim: header.dim, padded_dim: header.padded_dim, metric: header.metric,
+                 rotator, clusters, ex_bits: header.ex_bits, ip_func })
     }
 
     /// Insert a single vector into the index (in-memory).
@@ -2582,104 +2778,114 @@ impl IvfRabitqIndex {
 
     /// Batch-insert vectors with parallel rotation, centroid assignment
     /// via GEMM, and parallel quantisation.
+    /// Batch-insert vectors with parallel rotation, centroid assignment via
+    /// GEMM, and parallel quantisation.  Accepts `&[Vec<f32>]`; for streaming
+    /// use `insert_batch` with flat data.
     pub fn batch_insert(
         &mut self,
         start_id: usize,
         vectors: &[Vec<f32>],
     ) -> Result<(), RabitqError> {
+        let dim = self.dim;
+        let mut flat = Vec::with_capacity(vectors.len() * dim);
+        for v in vectors { flat.extend_from_slice(v); }
+        self.insert_batch(start_id, flat)?;
+        Ok(())
+    }
+
+    /// Insert a single flat batch `[n * dim]` into the index.
+    ///
+    /// Vectors are rotated, assigned to nearest centroids via GEMM, quantised,
+    /// and appended to cluster pending buffers.  The batch is consumed and
+    /// freed on return.
+    ///
+    /// Returns the number of vectors inserted (so the caller can advance
+    /// `start_id`).
+    ///
+    /// After all batches have been pushed, call `flush_all_pending()` then
+    /// `flush_v4(dir, &dirty_cids)` to persist.
+    pub fn insert_batch(
+        &mut self,
+        start_id: usize,
+        flat_batch: Vec<f32>,
+    ) -> Result<usize, RabitqError> {
         use rayon::prelude::*;
 
-        let n = vectors.len();
-        if n == 0 {
-            return Ok(());
-        }
         let dim = self.dim;
-
-        // 1. Rotate all vectors in parallel
-        let rotated: Vec<Vec<f32>> = vectors
-            .par_iter()
-            .map(|v| self.rotator.rotate(v))
-            .collect();
-
-        // 2. Build centroid matrix [padded_dim × k] col-major for GEMM
-        let k = self.clusters.len();
         let padded_dim = self.padded_dim;
+        let n = flat_batch.len() / dim;
+        if n == 0 { return Ok(0); }
+
+        // 1. Rotate batch (input: [n * dim], output: [n * padded_dim])
+        let rotated: Vec<f32> = {
+            let mut out = Vec::with_capacity(n * padded_dim);
+            for i in 0..n {
+                let v = &flat_batch[i * dim..(i + 1) * dim];
+                out.extend_from_slice(&self.rotator.rotate(v));
+            }
+            out
+        };
+        drop(flat_batch);
+
+        // 2. Build centroid matrix + norms (cached across calls by caller, but cheap)
+        let k = self.clusters.len();
         let centroid_col: Vec<f32> = {
             let mut col = vec![0.0f32; padded_dim * k];
             for (cid, cluster) in self.clusters.iter().enumerate() {
                 let c = &cluster.centroid;
-                for d in 0..padded_dim {
-                    col[d * k + cid] = c[d];
-                }
+                for d in 0..padded_dim { col[d * k + cid] = c[d]; }
             }
             col
         };
-        let centroid_norms: Vec<f32> = self
-            .clusters
-            .iter()
-            .map(|c| c.centroid.iter().map(|x| x * x).sum())
+        let centroid_norms: Vec<f32> = self.clusters
+            .iter().map(|c| c.centroid.iter().map(|x| x*x).sum())
             .collect();
 
-        // 3. Flatten rotated vectors [n × padded_dim] row-major
-        let flat_rotated: Vec<f32> = {
-            let mut flat = Vec::with_capacity(n * padded_dim);
-            for v in &rotated {
-                flat.extend_from_slice(v);
-            }
-            flat
-        };
-
-        // 4. GEMM: dot_products [n × k] = flat_rotated @ centroid_col
+        // 3. GEMM: dist matrix
         let mut dot_products = vec![0.0f32; n * k];
         unsafe {
             matrixmultiply::sgemm(
                 n, padded_dim, k, 1.0,
-                flat_rotated.as_ptr(), padded_dim as isize, 1,
+                rotated.as_ptr(), padded_dim as isize, 1,
                 centroid_col.as_ptr(), k as isize, 1,
                 0.0, dot_products.as_mut_ptr(), k as isize, 1,
             );
         }
 
-        // 5. Find nearest centroid per vector + quantise (parallel)
-        let norms: Vec<f32> = rotated
-            .iter()
-            .map(|v| v.iter().map(|x| x * x).sum())
+        // 4. Argmin + quantise (parallel)
+        let norms: Vec<f32> = (0..n)
+            .map(|i| rotated[i * padded_dim..(i + 1) * padded_dim].iter().map(|x| x*x).sum())
             .collect();
         let config = RabitqConfig::new(self.ex_bits + 1);
 
         let results: Vec<(usize, QuantizedVector)> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let norm = norms[i];
                 let mut best_cid = 0usize;
                 let mut best_dist = f32::INFINITY;
                 for c in 0..k {
                     let dot = dot_products[i * k + c];
-                    let mut dist = norm + centroid_norms[c] - 2.0 * dot;
-                    if dist < 0.0 {
-                        dist = 0.0;
-                    }
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_cid = c;
-                    }
+                    let mut dist = norms[i] + centroid_norms[c] - 2.0 * dot;
+                    if dist < 0.0 { dist = 0.0; }
+                    if dist < best_dist { best_dist = dist; best_cid = c; }
                 }
                 let q = crate::quantizer::quantize_with_centroid(
-                    &rotated[i],
+                    &rotated[i * padded_dim..(i + 1) * padded_dim],
                     &self.clusters[best_cid].centroid,
-                    &config,
-                    self.metric,
+                    &config, self.metric,
                 );
                 (best_cid, q)
             })
             .collect();
 
-        // 6. Append to clusters (sequential, per-cluster batch-friendly)
+        drop(rotated);
+
+        // 5. Append to clusters
         for (i, (cid, q)) in results.into_iter().enumerate() {
             self.clusters[cid].append_vector(start_id + i, q);
         }
 
-        Ok(())
+        Ok(n)
     }
 
     /// Flush dirty clusters to V4 directory by writing new segment files
@@ -2687,74 +2893,47 @@ impl IvfRabitqIndex {
     ///
     /// `dirty_cids` should contain the cluster ids that have been modified
     /// since the last `save_to_v4_dir` or `flush_v4`.
-    pub fn flush_v4<P: AsRef<Path>>(
+    pub async fn flush_v4(
         &self,
-        dir: P,
+        store: &dyn ObjectStore,
         dirty_cids: &[u32],
     ) -> Result<(), RabitqError> {
         use crate::manifest::{self, ClusterManifestEntry, ClusterSegmentData, ManifestHeader};
 
-        let dir = dir.as_ref();
-
-        // Read existing manifest to get current versions
-        let (_header, mut cluster_map) = manifest::load_manifest(dir)?;
+        let (_header, mut cluster_map) = crate::manifest::load_manifest(store).await?;
 
         for &cid in dirty_cids {
             let idx = cid as usize;
             let cluster = &self.clusters[idx];
-
-            // Bump version
             let old_entry = cluster_map.get(&cid);
             let new_version = old_entry.map_or(0, |e| e.segment_version.wrapping_add(1));
             let fname = manifest::segment_filename(cid, new_version);
-            let seg_path = dir.join(&fname);
 
             let seg_data = ClusterSegmentData::from_cluster_data(
-                cid,
-                cluster.centroid.clone(),
-                self.padded_dim,
-                self.ex_bits,
-                cluster.ids.clone(),
-                cluster.batch_data.clone(),
-                cluster.ex_codes_packed.clone(),
-                cluster.f_add_ex.clone(),
-                cluster.f_rescale_ex.clone(),
-                cluster.delta.clone(),
-                cluster.vl.clone(),
+                cid, cluster.centroid.clone(), self.padded_dim, self.ex_bits,
+                cluster.ids.clone(), cluster.batch_data.clone(),
+                cluster.ex_codes_packed.clone(), cluster.f_add_ex.clone(),
+                cluster.f_rescale_ex.clone(), cluster.delta.clone(), cluster.vl.clone(),
             );
+            let file_size = manifest::write_segment(store, &fname, &seg_data, new_version).await?;
 
-            let file_size = manifest::write_segment(&seg_path, &seg_data, new_version)?;
-
-            // Delete old segment file
+            // Delete old segment
             if let Some(old) = old_entry {
-                let old_path = dir.join(&old.segment_filename);
-                let _ = fs::remove_file(&old_path);
+                let _ = manifest::delete_segment(store, &old.segment_filename).await;
             }
 
-            cluster_map.insert(
-                cid,
-                ClusterManifestEntry {
-                    cluster_id: cid,
-                    segment_filename: fname,
-                    segment_version: new_version,
-                    num_vectors: cluster.num_vectors as u32,
-                    file_size,
-                },
-            );
+            cluster_map.insert(cid, ClusterManifestEntry {
+                cluster_id: cid, segment_filename: fname, segment_version: new_version,
+                num_vectors: cluster.num_vectors as u32, file_size,
+            });
         }
 
-        let rotator_type = self.rotator.rotator_type();
         let header = ManifestHeader {
-            dim: self.dim,
-            padded_dim: self.padded_dim,
-            metric: self.metric,
-            rotator_type,
-            rotator_data: self.rotator.serialize(),
-            ex_bits: self.ex_bits,
-            total_bits: self.ex_bits + 1,
+            dim: self.dim, padded_dim: self.padded_dim, metric: self.metric,
+            rotator_type: self.rotator.rotator_type(), rotator_data: self.rotator.serialize(),
+            ex_bits: self.ex_bits, total_bits: self.ex_bits + 1,
         };
-
-        manifest::save_manifest(dir, &header, &cluster_map)?;
+        manifest::save_manifest(store, &header, &cluster_map).await?;
         Ok(())
     }
 
@@ -2815,6 +2994,20 @@ fn assign_batch_to_centroids(
         assignments.push(best_cid);
     }
     assignments
+}
+
+// ----------------------------------------------------------------------------
+// ClusterSegmentData constructor (used by V4 save/flush)
+// ----------------------------------------------------------------------------
+
+impl crate::manifest::ClusterSegmentData {
+    pub fn from_cluster_data(
+        cluster_id: u32, centroid: Vec<f32>, padded_dim: usize, ex_bits: usize,
+        ids: Vec<usize>, batch_data: Vec<u8>, ex_codes_packed: Vec<Vec<u8>>,
+        f_add_ex: Vec<f32>, f_rescale_ex: Vec<f32>, delta: Vec<f32>, vl: Vec<f32>,
+    ) -> Self {
+        Self { cluster_id, centroid, padded_dim, ex_bits, ids, batch_data, ex_codes_packed, f_add_ex, f_rescale_ex, delta, vl }
+    }
 }
 
 // ----------------------------------------------------------------------------
