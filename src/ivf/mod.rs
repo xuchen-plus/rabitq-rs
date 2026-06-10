@@ -1,11 +1,9 @@
-use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::convert::TryFrom;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crc32fast::Hasher;
 use object_store::ObjectStore;
@@ -21,6 +19,12 @@ use crate::rotation::{DynamicRotator, RotatorType};
 use crate::simd;
 use crate::{Metric, RabitqError};
 
+pub mod builder;
+pub mod cluster;
+use cluster::*;
+pub mod lut;
+use lut::*;
+
 /// Parameters for IVF search.
 #[derive(Debug, Clone, Copy)]
 pub struct SearchParams {
@@ -28,85 +32,6 @@ pub struct SearchParams {
     pub nprobe: usize,
 }
 
-fn write_u32<W: Write>(writer: &mut W, value: u32, hasher: Option<&mut Hasher>) -> io::Result<()> {
-    let bytes = value.to_le_bytes();
-    if let Some(h) = hasher {
-        h.update(&bytes);
-    }
-    writer.write_all(&bytes)
-}
-
-fn write_u64<W: Write>(writer: &mut W, value: u64, hasher: Option<&mut Hasher>) -> io::Result<()> {
-    let bytes = value.to_le_bytes();
-    if let Some(h) = hasher {
-        h.update(&bytes);
-    }
-    writer.write_all(&bytes)
-}
-
-fn write_f32<W: Write>(writer: &mut W, value: f32, hasher: Option<&mut Hasher>) -> io::Result<()> {
-    let bytes = value.to_le_bytes();
-    if let Some(h) = hasher {
-        h.update(&bytes);
-    }
-    writer.write_all(&bytes)
-}
-
-fn read_u8<R: Read>(reader: &mut R, hasher: Option<&mut Hasher>) -> io::Result<u8> {
-    let mut buf = [0u8; 1];
-    reader.read_exact(&mut buf)?;
-    if let Some(h) = hasher {
-        h.update(&buf);
-    }
-    Ok(buf[0])
-}
-
-fn read_u32<R: Read>(reader: &mut R, hasher: Option<&mut Hasher>) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    if let Some(h) = hasher {
-        h.update(&buf);
-    }
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_u64<R: Read>(reader: &mut R, hasher: Option<&mut Hasher>) -> io::Result<u64> {
-    let mut buf = [0u8; 8];
-    reader.read_exact(&mut buf)?;
-    if let Some(h) = hasher {
-        h.update(&buf);
-    }
-    Ok(u64::from_le_bytes(buf))
-}
-
-fn read_f32<R: Read>(reader: &mut R, hasher: Option<&mut Hasher>) -> io::Result<f32> {
-    let mut buf = [0u8; 4];
-    reader.read_exact(&mut buf)?;
-    if let Some(h) = hasher {
-        h.update(&buf);
-    }
-    Ok(f32::from_le_bytes(buf))
-}
-
-fn usize_from_u64(value: u64) -> Result<usize, RabitqError> {
-    usize::try_from(value)
-        .map_err(|_| RabitqError::InvalidPersistence("value exceeds platform limits"))
-}
-
-fn metric_to_tag(metric: Metric) -> u8 {
-    match metric {
-        Metric::L2 => 0,
-        Metric::InnerProduct => 1,
-    }
-}
-
-fn tag_to_metric(tag: u8) -> Option<Metric> {
-    match tag {
-        0 => Some(Metric::L2),
-        1 => Some(Metric::InnerProduct),
-        _ => None,
-    }
-}
 
 impl SearchParams {
     pub fn new(top_k: usize, nprobe: usize) -> Self {
@@ -117,7 +42,7 @@ impl SearchParams {
 /// Result entry returned by IVF search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
-    pub id: usize,
+    pub id: u64,
     pub score: f32,
 }
 
@@ -128,8 +53,6 @@ pub(crate) struct SearchDiagnostics {
     pub extended_evaluations: usize,
 }
 
-const PERSIST_MAGIC: [u8; 4] = *b"RBQ1";
-const PERSIST_VERSION: u32 = 3; // V3: Unified memory layout with ClusterData
 
 // ============================================================================
 // Unified Memory Layout Data Structures (Phase 1 Optimization)
@@ -137,815 +60,8 @@ const PERSIST_VERSION: u32 = 3; // V3: Unified memory layout with ClusterData
 
 /// Generic 64-byte cache line aligned wrapper
 /// Ensures data is aligned to cache line boundaries for optimal performance
-#[repr(C, align(64))]
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct AlignedVec<T> {
-    data: Vec<T>,
-}
-
-impl<T> AlignedVec<T> {
-    #[allow(dead_code)]
-    fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    #[allow(dead_code)]
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(capacity),
-        }
-    }
-}
-
-impl<T> std::ops::Deref for AlignedVec<T> {
-    type Target = Vec<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.data
-    }
-}
-
-impl<T> std::ops::DerefMut for AlignedVec<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data
-    }
-}
-
-/// Unified cluster data with contiguous memory layout
-/// Eliminates V1/V2 split and scattered allocations
-/// Reference: OPTIMIZATION_PLAN.md Phase 1
-/// 64-byte cache line aligned for better cache efficiency
-#[repr(C, align(64))]
-#[derive(Debug, Clone)]
-struct ClusterData {
-    /// Cluster centroid
-    centroid: Vec<f32>,
-
-    /// Vector IDs (all vectors in cluster)
-    ids: Vec<usize>,
-
-    /// Single contiguous memory block for all batches
-    /// Layout: [Batch 0][Batch 1]...[Batch N]
-    /// Each batch layout:
-    ///   - packed_binary_codes: padded_dim * 32 / 8 bytes
-    ///   - f_add: 32 * 4 bytes (f32)
-    ///   - f_rescale: 32 * 4 bytes (f32)
-    ///   - f_error: 32 * 4 bytes (f32)
-    batch_data: Vec<u8>,
-
-    /// Packed extended codes (per-vector, C++-style on-demand unpacking)
-    /// Each vector: Vec<u8> containing bit-packed ex_code
-    /// Memory-efficient: ~(padded_dim * ex_bits / 8) bytes per vector
-    /// Unpacked on-demand only after lower-bound filtering (mimics C++ estimator.hpp:85-103)
-    /// Reference: OPTIMIZATION_PLAN.md - removes 4.4x memory overhead from pre-unpacking
-    ex_codes_packed: Vec<Vec<u8>>,
-
-    /// Per-vector ex parameters
-    f_add_ex: Vec<f32>,
-    f_rescale_ex: Vec<f32>,
-
-    /// Per-vector reconstruction parameters (for fetch_embedding)
-    delta: Vec<f32>,
-    vl: Vec<f32>,
-
-    /// Metadata
-    num_vectors: usize,    // vectors packed into batch_data
-    padded_dim: usize,
-    ex_bits: usize,
-
-    /// Pending vectors not yet packed into batch_data (O(1) insert).
-    /// Flushed in groups of 32 when full.
-    pending_ids: Vec<usize>,
-    pending_vectors: Vec<QuantizedVector>,
-}
-
-impl ClusterData {
-    /// Calculate bytes per batch in contiguous layout
-    #[inline(always)]
-    fn batch_stride(padded_dim: usize) -> usize {
-        let binary_codes_bytes = padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-        let params_bytes = std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE * 3; // f_add, f_rescale, f_error
-        binary_codes_bytes + params_bytes
-    }
-
-    /// Get number of complete batches
-    #[inline(always)]
-    fn num_complete_batches(&self) -> usize {
-        self.num_vectors / simd::FASTSCAN_BATCH_SIZE
-    }
-
-    /// Get number of remainder vectors
-    #[inline(always)]
-    fn num_remainder_vectors(&self) -> usize {
-        self.num_vectors % simd::FASTSCAN_BATCH_SIZE
-    }
-
-    /// Zero-copy access to packed binary codes for a batch
-    #[inline(always)]
-    fn batch_bin_codes(&self, batch_idx: usize) -> &[u8] {
-        let stride = Self::batch_stride(self.padded_dim);
-        let offset = batch_idx * stride;
-        let len = self.padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-        &self.batch_data[offset..offset + len]
-    }
-
-    /// Zero-copy access to f_add parameters for a batch
-    #[inline(always)]
-    fn batch_f_add(&self, batch_idx: usize) -> &[f32] {
-        let stride = Self::batch_stride(self.padded_dim);
-        let offset = batch_idx * stride + (self.padded_dim * simd::FASTSCAN_BATCH_SIZE / 8);
-        unsafe {
-            std::slice::from_raw_parts(
-                self.batch_data[offset..].as_ptr() as *const f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            )
-        }
-    }
-
-    /// Zero-copy access to f_rescale parameters for a batch
-    #[inline(always)]
-    fn batch_f_rescale(&self, batch_idx: usize) -> &[f32] {
-        let stride = Self::batch_stride(self.padded_dim);
-        let binary_bytes = self.padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-        let f_add_bytes = std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-        let offset = batch_idx * stride + binary_bytes + f_add_bytes;
-        unsafe {
-            std::slice::from_raw_parts(
-                self.batch_data[offset..].as_ptr() as *const f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            )
-        }
-    }
-
-    /// Zero-copy access to f_error parameters for a batch
-    #[inline(always)]
-    fn batch_f_error(&self, batch_idx: usize) -> &[f32] {
-        let stride = Self::batch_stride(self.padded_dim);
-        let binary_bytes = self.padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-        let f_add_bytes = std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-        let f_rescale_bytes = std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-        let offset = batch_idx * stride + binary_bytes + f_add_bytes + f_rescale_bytes;
-        unsafe {
-            std::slice::from_raw_parts(
-                self.batch_data[offset..].as_ptr() as *const f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            )
-        }
-    }
-
-    /// Get f_add for a single vector (for naive search)
-    #[allow(dead_code)]
-    fn get_vector_f_add(&self, vec_idx: usize) -> f32 {
-        let batch_idx = vec_idx / simd::FASTSCAN_BATCH_SIZE;
-        let in_batch_idx = vec_idx % simd::FASTSCAN_BATCH_SIZE;
-        self.batch_f_add(batch_idx)[in_batch_idx]
-    }
-
-    /// Get f_rescale for a single vector (for naive search)
-    #[allow(dead_code)]
-    fn get_vector_f_rescale(&self, vec_idx: usize) -> f32 {
-        let batch_idx = vec_idx / simd::FASTSCAN_BATCH_SIZE;
-        let in_batch_idx = vec_idx % simd::FASTSCAN_BATCH_SIZE;
-        self.batch_f_rescale(batch_idx)[in_batch_idx]
-    }
-
-    /// Mutable access to batch binary codes
-    #[allow(dead_code)]
-    fn batch_bin_codes_mut(&mut self, batch_idx: usize) -> &mut [u8] {
-        let stride = Self::batch_stride(self.padded_dim);
-        let offset = batch_idx * stride;
-        let len = self.padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-        &mut self.batch_data[offset..offset + len]
-    }
-
-    /// Mutable access to f_add parameters
-    #[allow(dead_code)]
-    fn batch_f_add_mut(&mut self, batch_idx: usize) -> &mut [f32] {
-        let stride = Self::batch_stride(self.padded_dim);
-        let offset = batch_idx * stride + (self.padded_dim * simd::FASTSCAN_BATCH_SIZE / 8);
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.batch_data[offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            )
-        }
-    }
-
-    /// Mutable access to f_rescale parameters
-    #[allow(dead_code)]
-    fn batch_f_rescale_mut(&mut self, batch_idx: usize) -> &mut [f32] {
-        let stride = Self::batch_stride(self.padded_dim);
-        let binary_bytes = self.padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-        let f_add_bytes = std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-        let offset = batch_idx * stride + binary_bytes + f_add_bytes;
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.batch_data[offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            )
-        }
-    }
-
-    /// Mutable access to f_error parameters
-    #[allow(dead_code)]
-    fn batch_f_error_mut(&mut self, batch_idx: usize) -> &mut [f32] {
-        let stride = Self::batch_stride(self.padded_dim);
-        let binary_bytes = self.padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-        let f_add_bytes = std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-        let f_rescale_bytes = std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-        let offset = batch_idx * stride + binary_bytes + f_add_bytes + f_rescale_bytes;
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.batch_data[offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            )
-        }
-    }
-
-    /// Reconstruct a ClusterData from deserialised segment data (used during
-    /// incremental flush to merge old on-disk data with new pending vectors).
-    fn from_segment(seg: crate::manifest::ClusterSegmentData) -> Self {
-        let nv = seg.ids.len();
-        Self {
-            centroid: seg.centroid,
-            ids: seg.ids,
-            batch_data: seg.batch_data,
-            ex_codes_packed: seg.ex_codes_packed,
-            f_add_ex: seg.f_add_ex,
-            f_rescale_ex: seg.f_rescale_ex,
-            delta: seg.delta,
-            vl: seg.vl,
-            num_vectors: nv,
-            padded_dim: seg.padded_dim,
-            ex_bits: seg.ex_bits,
-            pending_ids: Vec::new(),
-            pending_vectors: Vec::new(),
-        }
-    }
-
-    /// Create new empty cluster
-    #[allow(dead_code)]
-    fn new(centroid: Vec<f32>, padded_dim: usize, ex_bits: usize) -> Self {
-        Self {
-            centroid,
-            ids: Vec::new(),
-            batch_data: Vec::new(),
-            ex_codes_packed: Vec::new(),
-            f_add_ex: Vec::new(),
-            f_rescale_ex: Vec::new(),
-            delta: Vec::new(),
-            vl: Vec::new(),
-            num_vectors: 0,
-            padded_dim,
-            ex_bits,
-            pending_ids: Vec::new(),
-            pending_vectors: Vec::new(),
-        }
-    }
-
-    /// Calculate memory usage in bytes
-    fn memory_usage(&self) -> usize {
-        let ex_codes_heap: usize = self.ex_codes_packed.iter().map(|v| v.capacity()).sum();
-
-        std::mem::size_of::<Self>()
-            + self.centroid.len() * 4
-            + self.ids.capacity() * std::mem::size_of::<usize>()
-            + self.batch_data.capacity()
-            + self.ex_codes_packed.capacity() * std::mem::size_of::<Vec<u8>>()
-            + ex_codes_heap
-            + self.f_add_ex.capacity() * 4
-            + self.f_rescale_ex.capacity() * 4
-            + self.delta.capacity() * 4
-            + self.vl.capacity() * 4
-    }
-
-    /// Build ClusterData from quantized vectors
-    /// Implements unified memory layout with:
-    /// 1. Contiguous batch storage (eliminates scattered Vec allocations)
-    /// 2. Pre-unpacked ex_codes (avoids repeated unpacking)
-    fn from_quantized_vectors(
-        centroid: Vec<f32>,
-        ids: Vec<usize>,
-        vectors: Vec<QuantizedVector>,
-        padded_dim: usize,
-        ex_bits: usize,
-    ) -> Self {
-        let num_vectors = vectors.len();
-        let num_complete_batches = num_vectors / simd::FASTSCAN_BATCH_SIZE;
-        let num_remainder = num_vectors % simd::FASTSCAN_BATCH_SIZE;
-
-        let total_batches = if num_remainder > 0 {
-            num_complete_batches + 1
-        } else {
-            num_complete_batches
-        };
-
-        // Allocate contiguous memory for all batches
-        let stride = Self::batch_stride(padded_dim);
-        let mut batch_data = crate::memory::allocate_aligned_vec::<u8>(stride * total_batches);
-
-        // Pre-allocate storage for packed ex_codes and parameters
-        let mut ex_codes_packed = Vec::with_capacity(num_vectors);
-        let mut f_add_ex = Vec::with_capacity(num_vectors);
-        let mut f_rescale_ex = Vec::with_capacity(num_vectors);
-        let mut delta = Vec::with_capacity(num_vectors);
-        let mut vl = Vec::with_capacity(num_vectors);
-
-        let dim_bytes = padded_dim / 8;
-
-        // Process complete batches
-        for batch_idx in 0..num_complete_batches {
-            let start_idx = batch_idx * simd::FASTSCAN_BATCH_SIZE;
-            let end_idx = start_idx + simd::FASTSCAN_BATCH_SIZE;
-            let batch_vectors = &vectors[start_idx..end_idx];
-
-            // Pack this batch into contiguous memory
-            Self::pack_batch_into_memory(
-                batch_vectors,
-                &mut batch_data,
-                batch_idx,
-                padded_dim,
-                ex_bits,
-                &mut ex_codes_packed,
-                &mut f_add_ex,
-                &mut f_rescale_ex,
-                &mut delta,
-                &mut vl,
-            );
-        }
-
-        // Process remainder vectors
-        if num_remainder > 0 {
-            let start_idx = num_complete_batches * simd::FASTSCAN_BATCH_SIZE;
-            let batch_vectors = &vectors[start_idx..];
-
-            // Pad with zeros
-            let mut padded_vectors = batch_vectors.to_vec();
-            let ex_bytes_per_vec = if ex_bits > 0 {
-                padded_dim * ex_bits / 8
-            } else {
-                0
-            };
-            padded_vectors.resize(
-                simd::FASTSCAN_BATCH_SIZE,
-                QuantizedVector {
-                    binary_code_packed: vec![0u8; dim_bytes],
-                    ex_code_packed: vec![0u8; ex_bytes_per_vec],
-                    ex_bits: ex_bits as u8,
-                    dim: padded_dim,
-                    delta: 0.0,
-                    vl: 0.0,
-                    f_add: 0.0,
-                    f_rescale: 0.0,
-                    f_error: 0.0,
-                    residual_norm: 0.0,
-                    f_add_ex: 0.0,
-                    f_rescale_ex: 0.0,
-                },
-            );
-
-            // Call pack_batch_into_memory_partial to handle partial batches correctly
-            Self::pack_batch_into_memory_partial(
-                &padded_vectors,
-                num_remainder, // actual number of vectors
-                &mut batch_data,
-                num_complete_batches,
-                padded_dim,
-                ex_bits,
-                &mut ex_codes_packed,
-                &mut f_add_ex,
-                &mut f_rescale_ex,
-                &mut delta,
-                &mut vl,
-            );
-        }
-
-        Self {
-            centroid,
-            ids,
-            batch_data,
-            ex_codes_packed,
-            f_add_ex,
-            f_rescale_ex,
-            delta,
-            vl,
-            num_vectors,
-            padded_dim,
-            ex_bits,
-            pending_ids: Vec::new(),
-            pending_vectors: Vec::new(),
-        }
-    }
-
-    /// Pack 32 vectors into contiguous batch memory
-    /// Pack a partial batch into memory (handles the last batch with < 32 vectors)
-    #[allow(clippy::too_many_arguments)]
-    fn pack_batch_into_memory_partial(
-        vectors: &[QuantizedVector],
-        actual_count: usize, // actual number of vectors (before padding)
-        batch_data: &mut [u8],
-        batch_idx: usize,
-        padded_dim: usize,
-        ex_bits: usize,
-        ex_codes_packed: &mut Vec<Vec<u8>>,
-        f_add_ex: &mut Vec<f32>,
-        f_rescale_ex: &mut Vec<f32>,
-        delta: &mut Vec<f32>,
-        vl: &mut Vec<f32>,
-    ) {
-        assert_eq!(vectors.len(), simd::FASTSCAN_BATCH_SIZE);
-        assert!(actual_count <= simd::FASTSCAN_BATCH_SIZE);
-
-        let stride = Self::batch_stride(padded_dim);
-        let dim_bytes = padded_dim / 8;
-
-        // Calculate offsets in contiguous memory
-        let batch_offset = batch_idx * stride;
-        let binary_bytes = padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-
-        // Collect binary codes into flat buffer (including padding)
-        let mut binary_codes_flat = Vec::with_capacity(simd::FASTSCAN_BATCH_SIZE * dim_bytes);
-        for vec in vectors.iter() {
-            binary_codes_flat.extend_from_slice(&vec.binary_code_packed);
-        }
-
-        // Pack binary codes using FastScan layout
-        let packed_codes = &mut batch_data[batch_offset..batch_offset + binary_bytes];
-        simd::pack_codes(
-            &binary_codes_flat,
-            simd::FASTSCAN_BATCH_SIZE,
-            dim_bytes,
-            packed_codes,
-        );
-
-        // Get mutable slices for parameters
-        let f_add_offset = batch_offset + binary_bytes;
-        let f_rescale_offset =
-            f_add_offset + std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-        let f_error_offset =
-            f_rescale_offset + std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-
-        unsafe {
-            let f_add_slice = std::slice::from_raw_parts_mut(
-                batch_data[f_add_offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            );
-            let f_rescale_slice = std::slice::from_raw_parts_mut(
-                batch_data[f_rescale_offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            );
-            let f_error_slice = std::slice::from_raw_parts_mut(
-                batch_data[f_error_offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            );
-
-            // Copy parameters (including padding)
-            for (i, vec) in vectors.iter().enumerate() {
-                f_add_slice[i] = vec.f_add;
-                f_rescale_slice[i] = vec.f_rescale;
-                f_error_slice[i] = vec.f_error;
-            }
-        }
-
-        // Store packed ex_codes - ONLY for actual vectors, not padding!
-        // C++-style: Keep codes packed, unpack on-demand during search
-        for vec in vectors.iter().take(actual_count) {
-            // Store packed ex_code (no unpacking!)
-            if ex_bits > 0 {
-                ex_codes_packed.push(vec.ex_code_packed.clone());
-                f_add_ex.push(vec.f_add_ex);
-                f_rescale_ex.push(vec.f_rescale_ex);
-            } else {
-                ex_codes_packed.push(Vec::new());
-                f_add_ex.push(0.0);
-                f_rescale_ex.push(0.0);
-            }
-            // Store reconstruction parameters
-            delta.push(vec.delta);
-            vl.push(vec.vl);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn pack_batch_into_memory(
-        vectors: &[QuantizedVector],
-        batch_data: &mut [u8],
-        batch_idx: usize,
-        padded_dim: usize,
-        ex_bits: usize,
-        ex_codes_packed: &mut Vec<Vec<u8>>,
-        f_add_ex: &mut Vec<f32>,
-        f_rescale_ex: &mut Vec<f32>,
-        delta: &mut Vec<f32>,
-        vl: &mut Vec<f32>,
-    ) {
-        assert_eq!(vectors.len(), simd::FASTSCAN_BATCH_SIZE);
-
-        let stride = Self::batch_stride(padded_dim);
-        let dim_bytes = padded_dim / 8;
-
-        // Calculate offsets in contiguous memory
-        let batch_offset = batch_idx * stride;
-        let binary_bytes = padded_dim * simd::FASTSCAN_BATCH_SIZE / 8;
-
-        // Collect binary codes into flat buffer
-        let mut binary_codes_flat = Vec::with_capacity(simd::FASTSCAN_BATCH_SIZE * dim_bytes);
-        for vec in vectors.iter() {
-            binary_codes_flat.extend_from_slice(&vec.binary_code_packed);
-        }
-
-        // Pack binary codes using FastScan layout
-        let packed_codes = &mut batch_data[batch_offset..batch_offset + binary_bytes];
-        simd::pack_codes(
-            &binary_codes_flat,
-            simd::FASTSCAN_BATCH_SIZE,
-            dim_bytes,
-            packed_codes,
-        );
-
-        // Get mutable slices for parameters (using pointer arithmetic like C++)
-        let f_add_offset = batch_offset + binary_bytes;
-        let f_rescale_offset =
-            f_add_offset + std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-        let f_error_offset =
-            f_rescale_offset + std::mem::size_of::<f32>() * simd::FASTSCAN_BATCH_SIZE;
-
-        unsafe {
-            let f_add_slice = std::slice::from_raw_parts_mut(
-                batch_data[f_add_offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            );
-            let f_rescale_slice = std::slice::from_raw_parts_mut(
-                batch_data[f_rescale_offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            );
-            let f_error_slice = std::slice::from_raw_parts_mut(
-                batch_data[f_error_offset..].as_mut_ptr() as *mut f32,
-                simd::FASTSCAN_BATCH_SIZE,
-            );
-
-            // Copy parameters
-            for (i, vec) in vectors.iter().enumerate() {
-                f_add_slice[i] = vec.f_add;
-                f_rescale_slice[i] = vec.f_rescale;
-                f_error_slice[i] = vec.f_error;
-            }
-        }
-
-        // Store packed ex_codes for all vectors in batch
-        // C++-style: Keep codes packed, unpack on-demand during search
-        for vec in vectors.iter() {
-            // Store packed ex_code (no unpacking!)
-            if ex_bits > 0 {
-                ex_codes_packed.push(vec.ex_code_packed.clone());
-                f_add_ex.push(vec.f_add_ex);
-                f_rescale_ex.push(vec.f_rescale_ex);
-            } else {
-                ex_codes_packed.push(Vec::new());
-                f_add_ex.push(0.0);
-                f_rescale_ex.push(0.0);
-            }
-            // Store reconstruction parameters
-            delta.push(vec.delta);
-            vl.push(vec.vl);
-        }
-    }
-}
-
-// ============================================================================
-// Quantized vector for temporary use during training
-// ============================================================================
-
-/// Temporary structure used during index construction
-/// After construction, vectors are packed into ClusterData's unified memory layout
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct TemporaryQuantizedVector {
-    binary_code_packed: Vec<u8>,
-    ex_code_packed: Vec<u8>,
-    f_add: f32,
-    f_rescale: f32,
-    f_error: f32,
-    f_add_ex: f32,
-    f_rescale_ex: f32,
-}
-
 /// Lookup table for batch FastScan search
 /// Mimics C++ Lut class from lut.hpp
-struct QueryLut {
-    /// Quantized lookup table (i8 values for SIMD)
-    lut_i8: Vec<i8>,
-    /// Quantization delta factor
-    delta: f32,
-    /// Sum of vl across all lookup tables
-    sum_vl_lut: f32,
-}
-
-/// High-accuracy LUT with separated low8/high8 components
-/// Used for high-dimensional data (dim > 2048) to prevent overflow
-struct QueryLutHighAcc {
-    /// Low 8 bits of LUT values (u8 for unsigned values)
-    lut_low8: Vec<u8>,
-    /// High 8 bits of LUT values (u8 for unsigned values)
-    lut_high8: Vec<u8>,
-    /// Quantization delta factor
-    delta: f32,
-    /// Sum of vl across all lookup tables
-    sum_vl_lut: f32,
-}
-
-impl QueryLutHighAcc {
-    /// Build high-accuracy LUT from rotated query
-    /// Splits quantized values into low8 and high8 components
-    fn new(rotated_query: &[f32], padded_dim: usize) -> Self {
-        assert!(
-            padded_dim.is_multiple_of(4),
-            "padded_dim must be multiple of 4 for LUT"
-        );
-
-        // First compute float values like regular LUT
-        // pack_lut_f32 packs 4 dimensions into 16 LUT entries, repeated for each batch
-        let lut_size = (padded_dim / 4) * 16 * (padded_dim / 32);
-        let mut lut_f32 = vec![0.0f32; lut_size];
-        simd::pack_lut_f32(rotated_query, &mut lut_f32);
-
-        // Compute delta and sum_vl_lut
-        let sum: f32 = lut_f32.iter().sum();
-        let (delta, sum_vl) = if lut_f32.iter().all(|&x| x.abs() < f32::EPSILON) {
-            (1.0, 0.0)
-        } else {
-            let max_val = lut_f32.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            // Use larger range for high-accuracy mode (16-bit instead of 8-bit)
-            let delta = max_val / 32767.0; // i16::MAX
-            let sum_vl = sum / delta;
-            (delta, sum_vl)
-        };
-
-        // Quantize to 16-bit signed values first
-        let mut lut_i16 = vec![0i16; lut_f32.len()];
-        for (i, &val) in lut_f32.iter().enumerate() {
-            let quantized = (val / delta).round();
-            lut_i16[i] = quantized.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-        }
-
-        // Split into low8 and high8 components
-        let mut lut_low8 = vec![0u8; lut_i16.len()];
-        let mut lut_high8 = vec![0u8; lut_i16.len()];
-
-        for (i, &val) in lut_i16.iter().enumerate() {
-            // Convert i16 to u16 by adding 32768 (shift to unsigned range)
-            let unsigned_val = (val as i32 + 32768) as u16;
-            lut_low8[i] = (unsigned_val & 0xFF) as u8;
-            lut_high8[i] = ((unsigned_val >> 8) & 0xFF) as u8;
-        }
-
-        Self {
-            lut_low8,
-            lut_high8,
-            delta,
-            sum_vl_lut: sum_vl,
-        }
-    }
-}
-
-impl QueryLut {
-    /// Build LUT from rotated query
-    /// Reference: C++ Lut constructor in lut.hpp:27-53
-    fn new(rotated_query: &[f32], padded_dim: usize) -> Self {
-        assert!(
-            padded_dim.is_multiple_of(4),
-            "padded_dim must be multiple of 4 for LUT"
-        );
-
-        let table_length = padded_dim * 4; // padded_dim << 2
-
-        // Step 1: Generate float LUT using pack_lut_f32
-        let mut lut_float = vec![0.0f32; table_length];
-        simd::pack_lut_f32(rotated_query, &mut lut_float);
-
-        // Step 2: Find min and max of LUT
-        let vl_lut = lut_float
-            .iter()
-            .copied()
-            .min_by(|a, b| a.total_cmp(b))
-            .unwrap_or(0.0);
-        let vr_lut = lut_float
-            .iter()
-            .copied()
-            .max_by(|a, b| a.total_cmp(b))
-            .unwrap_or(0.0);
-
-        // Step 3: Compute delta for i8 quantization (8 bits)
-        let delta = (vr_lut - vl_lut) / 255.0f32; // (1 << 8) - 1 = 255
-
-        // Step 4: Quantize float LUT to i8
-        let mut lut_i8 = vec![0i8; table_length];
-        if delta > 0.0 {
-            for i in 0..table_length {
-                let quantized = ((lut_float[i] - vl_lut) / delta).round();
-                // Must convert to u8 first, then to i8 to avoid saturation
-                // f32 as i8 saturates at 127, but we need wrapping behavior (128-255 -> -128 to -1)
-                lut_i8[i] = (quantized.clamp(0.0, 255.0) as u8) as i8;
-            }
-        }
-
-        // Step 5: Compute sum_vl_lut
-        let num_table = table_length / 16;
-        let sum_vl_lut = vl_lut * (num_table as f32);
-
-        Self {
-            lut_i8,
-            delta,
-            sum_vl_lut,
-        }
-    }
-}
-
-/// Precomputed query constants to avoid repeated calculations during search.
-struct QueryPrecomputed {
-    rotated_query: Vec<f32>,
-    query_norm: f32,
-    k1x_sum_q: f32, // c1 × sum_query (precomputed)
-    kbx_sum_q: f32, // cb × sum_query (precomputed)
-    binary_scale: f32,
-    /// Optional LUT for FastScan batch search
-    lut: Option<QueryLut>,
-    /// Optional high-accuracy LUT for high-dimensional data
-    lut_highacc: Option<QueryLutHighAcc>,
-}
-
-impl QueryPrecomputed {
-    fn new(rotated_query: Vec<f32>, ex_bits: usize) -> Self {
-        let sum_query: f32 = rotated_query.iter().sum();
-        let query_norm: f32 = rotated_query.iter().map(|v| v * v).sum::<f32>().sqrt();
-        let c1 = -0.5f32;
-        let cb = -((1 << ex_bits) as f32 - 0.5);
-        let binary_scale = (1 << ex_bits) as f32;
-
-        Self {
-            rotated_query,
-            query_norm,
-            k1x_sum_q: c1 * sum_query,
-            kbx_sum_q: cb * sum_query,
-            binary_scale,
-            lut: None,         // LUT built on demand for batch search
-            lut_highacc: None, // High-accuracy LUT built on demand for high-dimensional data
-        }
-    }
-
-    /// Build LUT for FastScan batch search
-    /// Should be called once per query before searching clusters
-    fn build_lut(&mut self, padded_dim: usize) {
-        // Decide whether to use high-accuracy mode based on dimension
-        // Use high-accuracy for dimensions > 2048 to prevent overflow
-        let use_highacc = padded_dim > 2048;
-
-        if use_highacc {
-            if self.lut_highacc.is_none() {
-                self.lut_highacc = Some(QueryLutHighAcc::new(&self.rotated_query, padded_dim));
-            }
-        } else if self.lut.is_none() {
-            self.lut = Some(QueryLut::new(&self.rotated_query, padded_dim));
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct HeapCandidate {
-    id: usize,
-    distance: f32,
-    score: f32,
-}
-
-#[derive(Debug, Clone)]
-struct HeapEntry {
-    candidate: HeapCandidate,
-}
-
-impl PartialEq for HeapEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.candidate
-            .distance
-            .to_bits()
-            .eq(&other.candidate.distance.to_bits())
-            && self.candidate.id == other.candidate.id
-    }
-}
-
-impl Eq for HeapEntry {}
-
-impl PartialOrd for HeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.candidate.distance.total_cmp(&other.candidate.distance)
-    }
-}
 
 /// IVF + RaBitQ index implemented in Rust.
 #[derive(Debug, Clone)]
@@ -973,404 +89,7 @@ pub struct IvfRabitqIndex {
 // In fresh mode, insert_batch does reservoir sampling.
 // In loaded mode, insert_batch rotates + quantises + appends to clusters.
 
-enum BuilderState {
-    Fresh {
-        dim: usize,
-        nlist: usize,
-        total_bits: usize,
-        metric: Metric,
-        rotator_type: RotatorType,
-        seed: u64,
-        use_faster_config: bool,
-        padded_dim: usize,
-        ex_bits: usize,
-        reservoir: Vec<f32>,
-        reservoir_capacity: usize,
-        reservoir_count: usize,
-        reservoir_seen: usize,
-    },
-    Loaded {
-        index: IvfRabitqIndex,
-        /// Original segment metadata from manifest (segment file names,
-        /// versions, sizes).  Used during incremental flush to locate
-        /// and replace old segments.
-        cluster_map: std::collections::BTreeMap<u32, crate::manifest::ClusterManifestEntry>,
-        /// Total original vectors (sum of all cluster entry num_vectors).
-        /// Used as the starting id for `insert_batch` so new vectors
-        /// get globally-unique ids.
-        original_total: usize,
-    },
-}
 
-pub struct IvfRabitqBuilder {
-    state: BuilderState,
-}
-
-impl IvfRabitqBuilder {
-    /// Number of clusters (for metrics / display).
-    pub fn cluster_count(&self) -> usize {
-        match &self.state {
-            BuilderState::Fresh { nlist, .. } => *nlist,
-            BuilderState::Loaded { index, .. } => index.clusters.len(),
-        }
-    }
-
-    /// Padded dimension (for metrics).
-    pub fn padded_dim(&self) -> usize {
-        match &self.state {
-            BuilderState::Fresh { padded_dim, .. } => *padded_dim,
-            BuilderState::Loaded { index, .. } => index.padded_dim,
-        }
-    }
-
-    /// Load from an object store, or initialise a fresh builder if no
-    /// `manifest.bin` exists.
-    ///
-    /// - **Fresh**: no manifest → `insert_batch` reservoir-samples; `build`
-    ///   runs k-means + streaming quantisation.
-    /// - **Loaded**: manifest exists → reads centroids only from segments;
-    ///   `insert_batch` appends vectors directly; `build` flushes pending.
-    pub async fn load(
-        store: Arc<dyn ObjectStore>,
-        dim: usize, nlist: usize, total_bits: usize,
-        metric: Metric, rotator_type: RotatorType, seed: u64, use_faster_config: bool,
-    ) -> Result<Self, RabitqError> {
-        if crate::manifest::manifest_exists(&*store).await {
-            let (header, cluster_map) = crate::manifest::load_manifest(&*store).await?;
-            let mut clusters = Vec::with_capacity(cluster_map.len());
-            for (_cid, entry) in cluster_map.iter() {
-                // Read centroid from the base segment (version 0).
-                let base = entry.base_segment()
-                    .ok_or_else(|| RabitqError::InvalidPersistence("cluster has no base segment"))?;
-                let (_, centroid) = crate::manifest::read_segment_centroid(
-                    &*store, &base.segment_filename, header.padded_dim,
-                ).await?;
-                clusters.push(ClusterData {
-                    centroid,
-                    ids: Vec::new(), batch_data: Vec::new(),
-                    ex_codes_packed: Vec::new(), f_add_ex: Vec::new(), f_rescale_ex: Vec::new(),
-                    delta: Vec::new(), vl: Vec::new(), num_vectors: 0,
-                    padded_dim: header.padded_dim, ex_bits: header.ex_bits,
-                    pending_ids: Vec::new(), pending_vectors: Vec::new(),
-                });
-            }
-            let rotator = DynamicRotator::deserialize(
-                header.dim, header.padded_dim, header.rotator_type, &header.rotator_data,
-            )?;
-            let ip_func = crate::simd::select_excode_ipfunc(header.ex_bits);
-            let original_total: usize = cluster_map.values().map(|e| e.total_vectors()).sum();
-            let index = IvfRabitqIndex {
-                dim: header.dim, padded_dim: header.padded_dim, metric: header.metric,
-                rotator, clusters, ex_bits: header.ex_bits, ip_func,
-            };
-            return Ok(Self { state: BuilderState::Loaded { index, cluster_map, original_total } });
-        }
-
-        let rotator = DynamicRotator::new(dim, rotator_type, seed);
-        let reservoir_capacity = nlist * 64;
-        Ok(Self {
-            state: BuilderState::Fresh {
-                dim, nlist, total_bits, metric, rotator_type, seed, use_faster_config,
-                padded_dim: rotator.padded_dim(),
-                ex_bits: total_bits.saturating_sub(1),
-                reservoir: Vec::with_capacity(reservoir_capacity * dim),
-                reservoir_capacity,
-                reservoir_count: 0,
-                reservoir_seen: 0,
-            },
-        })
-    }
-
-    /// Push one flat batch `[n * dim]` into the builder.
-    ///
-    /// - **Fresh mode**: reservoir-samples vectors for k-means, drops batch.
-    /// - **Loaded mode**: rotates, finds centroids, quantises, appends to
-    ///   cluster pending buffers, drops batch.
-    pub fn insert_batch(&mut self, batch: Vec<f32>) -> Result<(), RabitqError> {
-        match &mut self.state {
-            BuilderState::Fresh { dim, reservoir, reservoir_capacity, reservoir_count, reservoir_seen, seed, .. } => {
-                let d = *dim;
-                let n = batch.len() / d;
-                let cap = *reservoir_capacity;
-                let mut rng = StdRng::seed_from_u64(seed.wrapping_add(*reservoir_seen as u64));
-                for i in 0..n {
-                    let v = &batch[i * d..(i + 1) * d];
-                    if *reservoir_count < cap {
-                        reservoir.extend_from_slice(v);
-                        *reservoir_count += 1;
-                    } else {
-                        let j = rng.gen_range(0..*reservoir_seen + i + 1);
-                        if j < cap {
-                            let dst = j * d;
-                            reservoir[dst..dst + d].copy_from_slice(v);
-                        }
-                    }
-                }
-                *reservoir_seen += n;
-                // batch dropped
-                Ok(())
-            }
-            BuilderState::Loaded { index, original_total, .. } => {
-                // `index.len()` returns 0 in lazy mode (centroids only).
-                // Use `original_total` from the manifest as the base id so
-                // new vectors receive globally-unique ids.
-                let start_id = *original_total + index.len();
-                index.insert_batch(start_id, batch)?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Finalise the builder.
-    ///
-    /// - **Fresh mode**: runs k-means on reservoir samples, then streams
-    ///   `next_batch` to rotate + quantise all vectors.  Returns the built index.
-    /// - **Loaded mode**: flushes pending vectors into batch_data, returns
-    ///   the index for persistence.
-    pub fn build(
-        self,
-        next_batch: Option<&mut impl FnMut() -> Option<Vec<f32>>>,
-    ) -> Result<IvfRabitqIndex, RabitqError> {
-        match self.state {
-            BuilderState::Fresh {
-                dim, nlist, total_bits, metric, rotator_type, seed, use_faster_config,
-                padded_dim, ex_bits,
-                reservoir, reservoir_count, reservoir_seen, ..
-            } => {
-                use crate::kmeans::{run_kmeans_on_flat, KMeansConfig};
-                use rayon::prelude::*;
-
-                let mut next_batch = next_batch
-                    .ok_or_else(|| RabitqError::InvalidConfig("build requires next_batch callback"))?;
-
-                println!("  Reservoir: {} / {} vectors ({:.1} MB)", reservoir_count, reservoir_seen,
-                         reservoir_count * dim * 4 / (1024 * 1024));
-                if reservoir_count == 0 {
-                    return Err(RabitqError::InvalidConfig("no vectors added"));
-                }
-
-                let rotator = DynamicRotator::new(dim, rotator_type, seed);
-
-                // Rotate reservoir sample
-                let t_rot = Instant::now();
-                let mut rotated_sample = vec![0.0f32; reservoir_count * padded_dim];
-                rotated_sample
-                    .par_chunks_mut(padded_dim)
-                    .enumerate()
-                    .for_each(|(i, chunk)| {
-                        let v = &reservoir[i * dim..(i + 1) * dim];
-                        chunk.copy_from_slice(&rotator.rotate(v));
-                    });
-                drop(reservoir);
-                let t_rot = t_rot.elapsed();
-
-                let t_km = Instant::now();
-                println!("  Training k-means ({} clusters, 15 iterations)...", nlist);
-                let kmeans_config = KMeansConfig {
-                    niter: 15, nredo: 1,
-                    seed: StdRng::seed_from_u64(seed).next_u64(),
-                    spherical: false, max_points_per_centroid: 64,
-                    decode_block_size: 32768,
-                };
-                let KMeansResult { centroids: rotated_centroids, .. } =
-                    run_kmeans_on_flat(&rotated_sample, reservoir_count, padded_dim, nlist, kmeans_config);
-                drop(rotated_sample);
-                let t_km = t_km.elapsed();
-
-                let config = if use_faster_config { RabitqConfig::faster(padded_dim, total_bits, seed) }
-                             else { RabitqConfig::new(total_bits) };
-                let mut clusters: Vec<ClusterData> = rotated_centroids.iter().map(|c| ClusterData {
-                    centroid: c.clone(), ids: Vec::new(), batch_data: Vec::new(),
-                    ex_codes_packed: Vec::new(), f_add_ex: Vec::new(), f_rescale_ex: Vec::new(),
-                    delta: Vec::new(), vl: Vec::new(), num_vectors: 0,
-                    padded_dim, ex_bits, pending_ids: Vec::new(), pending_vectors: Vec::new(),
-                }).collect();
-
-                let centroid_col: Vec<f32> = {
-                    let mut col = vec![0.0f32; padded_dim * nlist];
-                    for (cid, c) in rotated_centroids.iter().enumerate() {
-                        for d in 0..padded_dim { col[d * nlist + cid] = c[d]; }
-                    }
-                    col
-                };
-                let centroid_norms: Vec<f32> = rotated_centroids.iter().map(|c| c.iter().map(|x| x*x).sum()).collect();
-
-                println!("  Streaming rotation + quantisation...");
-                let mut global_id: usize = 0;
-                let mut bc: usize = 0;
-                let mut t_stream_rot = 0.0f64;
-                let mut t_stream_gemm = 0.0f64;
-                let mut t_stream_quant = 0.0f64;
-                let mut t_stream_append = 0.0f64;
-                const SUB_CHUNK: usize = 20_000;
-                while let Some(batch) = next_batch() {
-                    let bn = batch.len() / dim; bc += 1;
-                    for sub_start in (0..bn).step_by(SUB_CHUNK) {
-                        let sub_end = (sub_start + SUB_CHUNK).min(bn);
-                        let sub_n = sub_end - sub_start;
-
-                        let t0 = Instant::now();
-                        let mut rb = vec![0.0f32; sub_n * padded_dim];
-                        rb.par_chunks_mut(padded_dim)
-                            .enumerate()
-                            .for_each(|(k, chunk)| {
-                                let i = sub_start + k;
-                                let v = &batch[i * dim..(i + 1) * dim];
-                                chunk.copy_from_slice(&rotator.rotate(v));
-                            });
-                        t_stream_rot += t0.elapsed().as_secs_f64();
-
-                        let t0 = Instant::now();
-                        let bids = assign_batch_to_centroids(&rb, sub_n, nlist, padded_dim, &centroid_col, &centroid_norms);
-                        t_stream_gemm += t0.elapsed().as_secs_f64();
-
-                        let t0 = Instant::now();
-                        let ins: Vec<(usize, QuantizedVector)> = (0..sub_n).into_par_iter().map(|i| {
-                            let rv = &rb[i * padded_dim..(i + 1) * padded_dim];
-                            let cid = bids[i];
-                            (cid, crate::quantizer::quantize_with_centroid(rv, &clusters[cid].centroid, &config, metric))
-                        }).collect();
-                        t_stream_quant += t0.elapsed().as_secs_f64();
-
-                        let t0 = Instant::now();
-                        for (i, (cid, q)) in ins.into_iter().enumerate() {
-                            clusters[cid].append_vector(global_id + sub_start + i, q);
-                        }
-                        t_stream_append += t0.elapsed().as_secs_f64();
-                        drop(rb);
-                        drop(bids);
-                    }
-                    global_id += bn;
-                    drop(batch);
-                    if bc.is_multiple_of(10) { println!("    {} vectors...", global_id); }
-                }
-                let t_flush = Instant::now();
-                for c in &mut clusters { c.flush_pending(); }
-                let t_flush = t_flush.elapsed();
-                println!("  Build complete: {} vectors, {} clusters", global_id, clusters.len());
-                println!("  ── Phase timing ──");
-                println!("    rotate reservoir:  {:5.1}s", t_rot.as_secs_f64());
-                println!("    k-means (15 iter): {:5.1}s", t_km.as_secs_f64());
-                println!("    stream rotate:     {:5.1}s", t_stream_rot);
-                println!("    stream GEMM:       {:5.1}s", t_stream_gemm);
-                println!("    stream quantise:   {:5.1}s", t_stream_quant);
-                println!("    stream append:     {:5.1}s", t_stream_append);
-                println!("    flush_pending:     {:5.1}s", t_flush.as_secs_f64());
-                let ip_func = crate::simd::select_excode_ipfunc(ex_bits);
-                Ok(IvfRabitqIndex { dim, padded_dim, metric, rotator, clusters, ex_bits, ip_func })
-            }
-
-            BuilderState::Loaded { mut index, .. } => {
-                index.flush_all_pending();
-                Ok(index)
-            }
-        }
-    }
-
-    /// Flush the (built or loaded) index to object store.
-    ///
-    /// - **Fresh mode**: error — call `build()` first.
-    /// - **Loaded mode**: flushes pending, then for each dirty cluster writes a
-    ///   *delta* segment containing only the new vectors, and appends it to the
-    ///   cluster's segment list in the manifest.
-    ///
-    ///   No existing segment files are read, modified, or deleted — object
-    ///   storage files are immutable.  Clusters with no new vectors are left
-    ///   completely untouched.  After flush the in-memory index is reset to
-    ///   centroid-only state, ready for the next round of inserts.
-    pub async fn flush(
-        mut self,
-        store: &dyn ObjectStore,
-    ) -> Result<IvfRabitqIndex, RabitqError> {
-        match self.state {
-            BuilderState::Loaded { mut index, mut cluster_map, .. } => {
-                use crate::manifest::{self, ClusterSegmentData, ManifestHeader, SegmentManifestEntry};
-
-                // 1. Flush all pending vectors (including partial batches) into batch_data.
-                index.flush_all_pending();
-
-                // 2. Collect dirty clusters.
-                let dirty_cids: Vec<u32> = index.clusters.iter()
-                    .enumerate()
-                    .filter(|(_, c)| c.num_vectors > 0)
-                    .map(|(i, _)| i as u32)
-                    .collect();
-
-                if dirty_cids.is_empty() {
-                    println!("Flush: no dirty clusters, manifest unchanged.");
-                    return Ok(index);
-                }
-
-                println!("Flush: {} dirty / {} total clusters (delta segments)", dirty_cids.len(), index.clusters.len());
-
-                let mut total_new: usize = 0;
-
-                for &cid_u32 in &dirty_cids {
-                    let cid = cid_u32 as usize;
-                    let cluster = &index.clusters[cid];
-                    let entry = cluster_map.get_mut(&cid_u32)
-                        .ok_or_else(|| RabitqError::InvalidPersistence("cluster missing from manifest"))?;
-
-                    let n_new = cluster.num_vectors;
-                    total_new += n_new;
-
-                    // -- write delta segment with ONLY the new vectors --
-                    let new_version = entry.latest_version() + 1;
-                    let fname = manifest::segment_filename(cid_u32, new_version);
-                    let seg_data = ClusterSegmentData::from_cluster_data(
-                        cid_u32, cluster.centroid.clone(), cluster.padded_dim, cluster.ex_bits,
-                        cluster.ids.clone(), cluster.batch_data.clone(),
-                        cluster.ex_codes_packed.clone(), cluster.f_add_ex.clone(),
-                        cluster.f_rescale_ex.clone(), cluster.delta.clone(), cluster.vl.clone(),
-                    );
-                    let file_size = manifest::write_segment(store, &fname, &seg_data, new_version).await?;
-
-                    // -- append delta to cluster's segment list (no deletion) --
-                    entry.segments.push(SegmentManifestEntry {
-                        segment_filename: fname,
-                        segment_version: new_version,
-                        num_vectors: n_new as u32,
-                        file_size,
-                    });
-                }
-
-                // 3. Write updated manifest (object-store atomic PUT).
-                let header = ManifestHeader {
-                    dim: index.dim, padded_dim: index.padded_dim, metric: index.metric,
-                    rotator_type: index.rotator.rotator_type(),
-                    rotator_data: index.rotator.serialize(),
-                    ex_bits: index.ex_bits, total_bits: index.ex_bits + 1,
-                };
-                manifest::save_manifest(store, &header, &cluster_map).await?;
-
-                // 4. Reset clusters to centroid-only state for next insert cycle.
-                for &cid_u32 in &dirty_cids {
-                    let c = &mut index.clusters[cid_u32 as usize];
-                    c.ids.clear();
-                    c.batch_data.clear();
-                    c.ex_codes_packed.clear();
-                    c.f_add_ex.clear();
-                    c.f_rescale_ex.clear();
-                    c.delta.clear();
-                    c.vl.clear();
-                    c.num_vectors = 0;
-                    // pending is already empty after flush_all_pending
-                }
-
-                // If we stored the updated total we could update original_total,
-                // but self is consumed — next load() will re-read the manifest.
-
-                println!("Flush complete: {} delta segments ({} new vectors), {} segments total across all clusters",
-                         dirty_cids.len(), total_new,
-                         cluster_map.values().map(|e| e.segments.len()).sum::<usize>());
-                Ok(index)
-            }
-            BuilderState::Fresh { .. } => {
-                Err(RabitqError::InvalidConfig("call build() before flush() for fresh builder"))
-            }
-        }
-    }
-}
 
 impl IvfRabitqIndex {
     /// Train a new index from the provided dataset.
@@ -1668,7 +387,7 @@ impl IvfRabitqIndex {
                     (cid, q)
                 }).collect();
                 for (i, (cid, q)) in insertions.into_iter().enumerate() {
-                    clusters[cid].append_vector(global_id + sub_start + i, q);
+                    clusters[cid].append_vector((global_id + sub_start + i) as u64, q);
                 }
                 drop(rotated_chunk);
             }
@@ -1720,14 +439,14 @@ impl IvfRabitqIndex {
         };
 
         // Group vector indices by cluster
-        let mut cluster_indices: Vec<Vec<usize>> = vec![Vec::new(); centroids.len()];
+        let mut cluster_indices: Vec<Vec<u64>> = vec![Vec::new(); centroids.len()];
         for (idx, &cluster_id) in assignments.iter().enumerate() {
             if cluster_id >= centroids.len() {
                 return Err(RabitqError::InvalidConfig(
                     "assignments reference invalid cluster ids",
                 ));
             }
-            cluster_indices[cluster_id].push(idx);
+            cluster_indices[cluster_id].push(idx as u64);
         }
 
         // Parallelize quantization across clusters and within clusters
@@ -1736,7 +455,7 @@ impl IvfRabitqIndex {
         let progress_counter = AtomicUsize::new(0);
         let total_clusters = centroids.len();
 
-        let cluster_data: Vec<(Vec<usize>, Vec<QuantizedVector>)> = centroids
+        let cluster_data: Vec<(Vec<u64>, Vec<QuantizedVector>)> = centroids
             .par_iter()
             .enumerate()
             .map(|(cluster_id, centroid)| {
@@ -1744,7 +463,7 @@ impl IvfRabitqIndex {
                 let quantized_vectors: Vec<QuantizedVector> = indices
                     .par_iter()
                     .map(|&idx| {
-                        quantize_with_centroid(&rotated_data[idx], centroid, &config, metric)
+                        quantize_with_centroid(&rotated_data[idx as usize], centroid, &config, metric)
                     })
                     .collect();
 
@@ -1760,7 +479,7 @@ impl IvfRabitqIndex {
                     );
                 }
 
-                (indices.clone(), quantized_vectors)
+                (indices.iter().map(|&i| i as u64).collect(), quantized_vectors)
             })
             .collect();
         println!("Quantization complete");
@@ -1851,7 +570,7 @@ impl IvfRabitqIndex {
     /// # Note
     /// The returned vector is an approximation due to quantization losses.
     /// The accuracy depends on the `total_bits` parameter used during training.
-    pub fn fetch_embedding(&self, vector_id: usize) -> Option<Vec<f32>> {
+    pub fn fetch_embedding(&self, vector_id: u64) -> Option<Vec<f32>> {
         // Find which cluster contains this vector ID
         for cluster in &self.clusters {
             if let Some(local_idx) = cluster.ids.iter().position(|&id| id == vector_id) {
@@ -2181,7 +900,7 @@ impl IvfRabitqIndex {
             // Load vector IDs
             let mut ids = Vec::with_capacity(num_vectors);
             for _ in 0..num_vectors {
-                ids.push(usize_from_u64(read_u64(&mut reader, Some(&mut hasher))?)?);
+                ids.push(read_u64(&mut reader, Some(&mut hasher))?);
             }
 
             // Load batch_data (contiguous memory block)
@@ -2988,7 +1707,7 @@ impl IvfRabitqIndex {
         let quantized = crate::quantizer::quantize_with_centroid(
             &rotated, &self.clusters[cid].centroid, &config, self.metric,
         );
-        self.clusters[cid].append_vector(vector_id, quantized);
+        self.clusters[cid].append_vector(vector_id as u64, quantized);
         Ok(cid as u32)
     }
 
@@ -2999,7 +1718,7 @@ impl IvfRabitqIndex {
     /// use `insert_batch` with flat data.
     pub fn batch_insert(
         &mut self,
-        start_id: usize,
+        start_id: u64,
         vectors: &[Vec<f32>],
     ) -> Result<(), RabitqError> {
         let dim = self.dim;
@@ -3022,7 +1741,7 @@ impl IvfRabitqIndex {
     /// `flush_v4(dir, &dirty_cids)` to persist.
     pub fn insert_batch(
         &mut self,
-        start_id: usize,
+        start_id: u64,
         flat_batch: Vec<f32>,
     ) -> Result<usize, RabitqError> {
         use rayon::prelude::*;
@@ -3065,7 +1784,7 @@ impl IvfRabitqIndex {
             use faer::{Accum, Par};
             let a = MatRef::from_row_major_slice(&rotated, n, padded_dim);
             let b = MatRef::from_row_major_slice(&centroid_col, padded_dim, k);
-            let mut c = MatMut::from_row_major_slice_mut(&mut dot_products, n, k);
+            let c = MatMut::from_row_major_slice_mut(&mut dot_products, n, k);
             matmul(c, Accum::Replace, a, b, 1.0f32, Par::rayon(0));
         }
 
@@ -3099,7 +1818,7 @@ impl IvfRabitqIndex {
 
         // 5. Append to clusters
         for (i, (cid, q)) in results.into_iter().enumerate() {
-            self.clusters[cid].append_vector(start_id + i, q);
+            self.clusters[cid].append_vector(start_id + i as u64, q);
         }
 
         Ok(n)
@@ -3116,7 +1835,7 @@ impl IvfRabitqIndex {
         store: &dyn ObjectStore,
         dirty_cids: &[u32],
     ) -> Result<(), RabitqError> {
-        use crate::manifest::{self, ClusterManifestEntry, ClusterSegmentData, ManifestHeader, SegmentManifestEntry};
+        use crate::manifest::{self, ClusterSegmentData, ManifestHeader, SegmentManifestEntry};
 
         let (_header, mut cluster_map) = crate::manifest::load_manifest(store).await?;
 
@@ -3194,7 +1913,7 @@ fn assign_batch_to_centroids(
         use faer::{Accum, Par};
         let a = MatRef::from_row_major_slice(rotated_batch, batch_n, padded_dim);
         let b = MatRef::from_row_major_slice(centroid_col, padded_dim, k);
-        let mut c = MatMut::from_row_major_slice_mut(&mut dot_products, batch_n, k);
+        let c = MatMut::from_row_major_slice_mut(&mut dot_products, batch_n, k);
         matmul(c, Accum::Replace, a, b, 1.0f32, Par::rayon(0));
     }
     let norms: Vec<f32> = (0..batch_n)
@@ -3225,7 +1944,7 @@ fn assign_batch_to_centroids(
 impl crate::manifest::ClusterSegmentData {
     pub fn from_cluster_data(
         cluster_id: u32, centroid: Vec<f32>, padded_dim: usize, ex_bits: usize,
-        ids: Vec<usize>, batch_data: Vec<u8>, ex_codes_packed: Vec<Vec<u8>>,
+        ids: Vec<u64>, batch_data: Vec<u8>, ex_codes_packed: Vec<Vec<u8>>,
         f_add_ex: Vec<f32>, f_rescale_ex: Vec<f32>, delta: Vec<f32>, vl: Vec<f32>,
     ) -> Self {
         Self { cluster_id, centroid, padded_dim, ex_bits, ids, batch_data, ex_codes_packed, f_add_ex, f_rescale_ex, delta, vl }
@@ -3249,7 +1968,7 @@ impl ClusterData {
 
     /// Append one quantised vector to the pending buffer.
     /// Flushes a batch of 32 into `batch_data` when full.
-    fn append_vector(&mut self, new_id: usize, new_q: QuantizedVector) {
+    fn append_vector(&mut self, new_id: u64, new_q: QuantizedVector) {
         self.pending_ids.push(new_id);
         self.pending_vectors.push(new_q);
         if self.pending_ids.len() >= simd::FASTSCAN_BATCH_SIZE {
@@ -3273,7 +1992,7 @@ impl ClusterData {
             // Drain 32 vectors
             let batch_qvecs: Vec<QuantizedVector> =
                 self.pending_vectors.drain(..simd::FASTSCAN_BATCH_SIZE).collect();
-            let batch_ids: Vec<usize> =
+            let batch_ids: Vec<u64> =
                 self.pending_ids.drain(..simd::FASTSCAN_BATCH_SIZE).collect();
 
             // Append this batch into batch_data
@@ -3354,7 +2073,7 @@ impl ClusterData {
 
             let mut batch_qvecs: Vec<QuantizedVector> =
                 self.pending_vectors.drain(..).collect();
-            let batch_ids: Vec<usize> =
+            let batch_ids: Vec<u64> =
                 self.pending_ids.drain(..).collect();
             let actual_count = batch_qvecs.len();
 
@@ -3473,7 +2192,6 @@ mod batch_search_tests {
     use crate::quantizer::RabitqConfig;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-
     fn random_vector(dim: usize, rng: &mut StdRng) -> Vec<f32> {
         (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect()
     }
@@ -3693,7 +2411,7 @@ mod batch_search_tests {
         // Create cluster with unified memory layout
         let cluster = ClusterData::from_quantized_vectors(
             centroid.clone(),
-            ids.clone(),
+            ids.iter().map(|&x| x as u64).collect(),
             quantized_vectors.clone(),
             padded_dim,
             ex_bits,
@@ -3816,7 +2534,7 @@ mod batch_search_tests {
         // Create unified cluster
         let cluster = ClusterData::from_quantized_vectors(
             centroid.clone(),
-            ids.clone(),
+            ids.iter().map(|&x| x as u64).collect(),
             quantized_vectors,
             padded_dim,
             ex_bits,

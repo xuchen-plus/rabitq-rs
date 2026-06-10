@@ -302,14 +302,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let all_new = read_fvecs(ip, None)?;
             if !all_new.is_empty() {
                 let batch_size = 50_000;
-                let mut start_id = index.len();
+                let mut start_id = index.len() as u64;
                 let mut index = index;
                 let t0 = Instant::now();
                 for chunk in all_new.chunks(batch_size) {
                     let mut flat = Vec::with_capacity(chunk.len() * dim);
                     for v in chunk { flat.extend_from_slice(v); }
                     let n = index.insert_batch(start_id, flat)?;
-                    start_id += n;
+                    start_id += n as u64;
                 }
                 index.flush_all_pending();
                 println!("  Inserted {} vectors in {:.1}s ({:.0} vec/s)",

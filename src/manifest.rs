@@ -120,7 +120,7 @@ pub struct ClusterSegmentData {
     pub centroid: Vec<f32>,
     pub padded_dim: usize,
     pub ex_bits: usize,
-    pub ids: Vec<usize>,
+    pub ids: Vec<u64>,
     pub batch_data: Vec<u8>,
     pub ex_codes_packed: Vec<Vec<u8>>,
     pub f_add_ex: Vec<f32>,
@@ -293,7 +293,7 @@ pub async fn read_segment_full(
     for v in &mut centroid { *v = rle!(r, f32); hup!(Some(&mut h), &v.to_le_bytes()); }
 
     let mut ids = Vec::with_capacity(nv);
-    for _ in 0..nv { let id = rle!(r, u64); hup!(Some(&mut h), &id.to_le_bytes()); ids.push(uf64(id)?); }
+    for _ in 0..nv { let id = rle!(r, u64); hup!(Some(&mut h), &id.to_le_bytes()); ids.push(id); }
 
     let bdl = uf64(rle!(r, u64))?; hup!(Some(&mut h), &(bdl as u64).to_le_bytes());
     let mut batch_data = vec![0u8; bdl]; r.read_exact(&mut batch_data)?; h.update(&batch_data);

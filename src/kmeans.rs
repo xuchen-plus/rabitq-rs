@@ -467,7 +467,7 @@ fn assign_points_for_update(
         {
             let a = MatRef::from_row_major_slice(data_chunk, len, dim);
             let b = MatRef::from_row_major_slice(centroid_col, dim, k);
-            let mut c = MatMut::from_row_major_slice_mut(
+            let c = MatMut::from_row_major_slice_mut(
                 &mut state.buffer.dot_products, len, k,
             );
             matmul(c, Accum::Replace, a, b, 1.0f32, Par::rayon(0));
@@ -626,7 +626,7 @@ fn compute_chunk_assignments_only(
     {
         let a = MatRef::from_row_major_slice(data_chunk, len, dim);
         let b = MatRef::from_row_major_slice(centroid_col, dim, k);
-        let mut c = MatMut::from_row_major_slice_mut(&mut dot_products, len, k);
+        let c = MatMut::from_row_major_slice_mut(&mut dot_products, len, k);
         matmul(c, Accum::Replace, a, b, 1.0f32, Par::rayon(0));
     }
 
@@ -740,8 +740,8 @@ pub fn run_kmeans_on_flat(
         config.decode_block_size,
     );
 
-    let centroid_views: Vec<f32> = centroids.clone();
-    let centroid_norms: Vec<f32> = centroids
+    let _centroid_views: Vec<f32> = centroids.clone();
+    let _centroid_norms: Vec<f32> = centroids
         .chunks(dim)
         .map(|c| c.iter().map(|x| x * x).sum())
         .collect();

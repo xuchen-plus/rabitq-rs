@@ -172,9 +172,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let topk = effective_topk;
 
     // Build ground truth sets for fast recall lookup
-    let gt_sets: Vec<std::collections::HashSet<usize>> = gt
+    let gt_sets: Vec<std::collections::HashSet<u64>> = gt
         .iter()
-        .map(|row| row.iter().take(topk).copied().collect())
+        .map(|row| row.iter().take(topk).map(|&x| x as u64).collect())
         .collect();
 
     // ----------------------------------------------------------------

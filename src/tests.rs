@@ -131,7 +131,7 @@ fn ivf_search_recovers_identical_vectors() {
         // the exact top result might vary. Check that:
         // 1. The target vector is in the top-K results
         // 2. The target vector has a small L2 distance (close to 0)
-        let target_result = results.iter().find(|r| r.id == idx);
+        let target_result = results.iter().find(|r| r.id == idx as u64);
         if target_result.is_none() {
             println!(
                 "Query {} - target not in top-{} results:",
@@ -851,12 +851,12 @@ fn filtered_search_returns_correct_results() {
     }
 
     // The filtered results should be a subset of unfiltered results (after applying the filter)
-    let unfiltered_filtered_ids: Vec<usize> = unfiltered_results
+    let unfiltered_filtered_ids: Vec<u64> = unfiltered_results
         .iter()
         .filter(|r| filter.contains(r.id as u32))
         .map(|r| r.id)
         .collect();
-    let filtered_ids: Vec<usize> = filtered_results.iter().map(|r| r.id).collect();
+    let filtered_ids: Vec<u64> = filtered_results.iter().map(|r| r.id).collect();
 
     // The top results should match
     let min_len = filtered_ids.len().min(unfiltered_filtered_ids.len());
@@ -1641,7 +1641,7 @@ fn test_fetch_embedding_reconstruction() {
     // Test fetching embeddings
     for (vector_id, original) in data.iter().enumerate() {
         let reconstructed = index
-            .fetch_embedding(vector_id)
+            .fetch_embedding(vector_id as u64)
             .unwrap_or_else(|| panic!("Failed to fetch embedding for vector {}", vector_id));
 
         assert_eq!(
@@ -1709,7 +1709,7 @@ fn test_fetch_embedding_fht_rotator() {
         let vector_id = rng.gen_range(0..num_vectors);
         let original = &data[vector_id];
         let reconstructed = index
-            .fetch_embedding(vector_id)
+            .fetch_embedding(vector_id as u64)
             .unwrap_or_else(|| panic!("Failed to fetch embedding for vector {}", vector_id));
 
         assert_eq!(reconstructed.len(), dim);
