@@ -57,4 +57,10 @@ pub enum RabitqError {
     /// Returned when the persisted bytes are inconsistent or corrupt.
     #[error("invalid persisted index: {0}")]
     InvalidPersistence(&'static str),
+    /// Returned when LATEST etag doesn't match — another writer committed first.
+    #[error("version conflict: another process updated the index; retry")]
+    VersionConflict,
+    /// Returned when the generation changed — centroids have been rebuilt.
+    #[error("generation conflict: centroids were rebuilt; caller must re-insert vectors")]
+    GenerationConflict,
 }

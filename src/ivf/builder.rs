@@ -76,7 +76,12 @@ impl IvfRabitqBuilder {
         metric: Metric, rotator_type: RotatorType, seed: u64, use_faster_config: bool,
     ) -> Result<Self, RabitqError> {
         if crate::manifest::manifest_exists(&*store).await {
-            let (header, cluster_map) = crate::manifest::load_manifest(&*store).await?;
+            // Try LATEST first, fall back to legacy manifest.bin
+            let (header, cluster_map) = match crate::manifest::read_latest(&*store).await {
+                Ok(snap) if snap.generation > 0 =>
+                    crate::manifest::load_manifest_by_gen_ver(&*store, snap.generation, snap.version).await?,
+                _ => crate::manifest::load_manifest(&*store).await?,
+            };
             let mut clusters = Vec::with_capacity(cluster_map.len());
             for (_cid, entry) in cluster_map.iter() {
                 // Read centroid from the base segment (version 0).
@@ -374,14 +379,36 @@ impl IvfRabitqBuilder {
                     });
                 }
 
-                // 3. Write updated manifest (object-store atomic PUT).
+                // 3. CAS loop: read LATEST, write versioned manifest, CAS-write LATEST.
+                let latest = manifest::read_latest(store).await?;
+                let new_version = latest.version + 1;
                 let header = ManifestHeader {
+                    generation: latest.generation,
                     dim: index.dim, padded_dim: index.padded_dim, metric: index.metric,
                     rotator_type: index.rotator.rotator_type(),
                     rotator_data: index.rotator.serialize(),
                     ex_bits: index.ex_bits, total_bits: index.ex_bits + 1,
                 };
-                manifest::save_manifest(store, &header, &cluster_map).await?;
+
+                // Write the new immutable versioned manifest.
+                manifest::save_manifest(store, &header, &cluster_map, new_version).await?;
+
+                // CAS the LATEST pointer.
+                match manifest::write_latest(store, latest.generation, new_version, latest.e_tag).await {
+                    Ok(_) => {} // committed
+                    Err(RabitqError::VersionConflict) => {
+                        // Check if generation changed (compaction happened).
+                        let latest2 = manifest::read_latest(store).await?;
+                        if latest2.generation != latest.generation {
+                            return Err(RabitqError::GenerationConflict);
+                        }
+                        // Same generation, just concurrent flush — retry once.
+                        let new_version2 = latest2.version + 1;
+                        manifest::save_manifest(store, &header, &cluster_map, new_version2).await?;
+                        manifest::write_latest(store, latest2.generation, new_version2, latest2.e_tag).await?;
+                    }
+                    Err(e) => return Err(e),
+                }
 
                 // 4. Reset clusters to centroid-only state for next insert cycle.
                 for &cid_u32 in &dirty_cids {

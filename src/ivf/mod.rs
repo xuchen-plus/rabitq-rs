@@ -1615,6 +1615,7 @@ impl IvfRabitqIndex {
 
         let rotator_type = self.rotator.rotator_type();
         let header = ManifestHeader {
+            generation: 1,
             dim: self.dim, padded_dim: self.padded_dim, metric: self.metric,
             rotator_type, rotator_data: self.rotator.serialize(),
             ex_bits: self.ex_bits, total_bits: self.ex_bits + 1,
@@ -1643,7 +1644,7 @@ impl IvfRabitqIndex {
                 }],
             });
         }
-        manifest::save_manifest(store, &header, &cluster_map).await?;
+        manifest::save_manifest(store, &header, &cluster_map, 0).await?;
         println!("Saved V4 index: {} clusters, {} base segments", self.clusters.len(), cluster_map.len());
         Ok(())
     }
@@ -1654,7 +1655,13 @@ impl IvfRabitqIndex {
     /// deltas) for every cluster, merging them into a single `ClusterData`
     /// in memory.
     pub async fn load_from_v4(store: Arc<dyn ObjectStore>) -> Result<Self, RabitqError> {
-        let (header, cluster_map) = crate::manifest::load_manifest(&*store).await?;
+        // Try LATEST → versioned manifest first, fall back to legacy manifest.bin.
+        let (header, cluster_map) = match crate::manifest::read_latest(&*store).await {
+            Ok(snap) if snap.generation > 0 => {
+                crate::manifest::load_manifest_by_gen_ver(&*store, snap.generation, snap.version).await?
+            }
+            _ => crate::manifest::load_manifest(&*store).await?,
+        };
         let mut clusters = Vec::with_capacity(cluster_map.len());
         for (_cid, entry) in cluster_map.iter() {
             // Merge all segments (base + deltas) for this cluster.
@@ -1869,11 +1876,12 @@ impl IvfRabitqIndex {
         }
 
         let header = ManifestHeader {
+            generation: 1,
             dim: self.dim, padded_dim: self.padded_dim, metric: self.metric,
             rotator_type: self.rotator.rotator_type(), rotator_data: self.rotator.serialize(),
             ex_bits: self.ex_bits, total_bits: self.ex_bits + 1,
         };
-        manifest::save_manifest(store, &header, &cluster_map).await?;
+        manifest::save_manifest(store, &header, &cluster_map, 0).await?;
         Ok(())
     }
 

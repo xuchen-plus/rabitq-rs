@@ -19,9 +19,16 @@ use object_store::path::Path as StorePath;
 use crate::{Metric, RabitqError, RotatorType};
 
 pub const V4_MANIFEST_MAGIC: [u8; 4] = *b"RBQ3";
-pub const V4_MANIFEST_VERSION: u32 = 2; // delta-segment support
+pub const V4_MANIFEST_VERSION: u32 = 3; // generation+version control
 pub const V4_SEGMENT_MAGIC: [u8; 4] = *b"SEG1";
-pub const MANIFEST_FILENAME: &str = "manifest.bin";
+pub const MANIFEST_FILENAME: &str = "manifest.bin"; // legacy V1/V2
+pub const LATEST_FILENAME: &str = "LATEST";
+pub const MANIFESTS_PREFIX: &str = "manifests";
+
+/// Manifest directory + filename for a specific (generation, version) pair.
+pub fn versioned_manifest_filename(generation: u64, version: u64) -> String {
+    format!("{MANIFESTS_PREFIX}/g{generation:08}_v{version:08}.bin")
+}
 
 // ---- little-endian read/write with optional hasher ----
 
@@ -109,9 +116,18 @@ impl ClusterManifestEntry {
 
 #[derive(Debug, Clone)]
 pub struct ManifestHeader {
+    pub generation: u64,
     pub dim: usize, pub padded_dim: usize, pub metric: Metric,
     pub rotator_type: RotatorType, pub rotator_data: Vec<u8>,
     pub ex_bits: usize, pub total_bits: usize,
+}
+
+/// Latest snapshot pointer: (generation, version, e_tag).
+#[derive(Debug, Clone)]
+pub struct LatestSnapshot {
+    pub generation: u64,
+    pub version: u64,
+    pub e_tag: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,11 +166,11 @@ fn read_segment_entry<R: Read>(r: &mut R, h: &mut Option<&mut Hasher>) -> Result
     Ok(SegmentManifestEntry { segment_filename: fname, segment_version: sv, num_vectors: nv, file_size: fs })
 }
 
-pub async fn load_manifest(
-    store: &dyn ObjectStore,
+/// Read manifest from a specific store path (legacy manifest.bin or versioned path).
+async fn read_manifest_bytes(
+    store: &dyn ObjectStore, key: &str,
 ) -> Result<(ManifestHeader, BTreeMap<u32, ClusterManifestEntry>), RabitqError> {
-    let key = StorePath::from(MANIFEST_FILENAME);
-    let result = store.get(&key).await.map_err(os_err)?;
+    let result = store.get(&StorePath::from(key)).await.map_err(os_err)?;
     let bytes = result.bytes().await.map_err(os_err)?;
     let mut r = Cursor::new(bytes.as_ref());
 
@@ -162,12 +178,16 @@ pub async fn load_manifest(
     if magic != V4_MANIFEST_MAGIC {
         return Err(RabitqError::InvalidPersistence("not a V4 manifest"));
     }
-    let version = rle!(r, u32);
-    if version != 1 && version != V4_MANIFEST_VERSION {
+    let file_version = rle!(r, u32);
+    if file_version < 1 || file_version > V4_MANIFEST_VERSION {
         return Err(RabitqError::InvalidPersistence("unsupported manifest version"));
     }
 
+    // V3+: generation field before dim. V1/V2: default to generation 1.
+    let generation: u64 = if file_version >= 3 { rle!(r, u64) } else { 1 };
+
     let mut h = Hasher::new();
+    h.update(&generation.to_le_bytes());
     let dim = rle!(r, u32) as usize;     hup!(Some(&mut h), &(dim as u32).to_le_bytes());
     let pd = rle!(r, u32) as usize;      hup!(Some(&mut h), &(pd as u32).to_le_bytes());
     let mtag = rle!(r, u8);              hup!(Some(&mut h), &[mtag]);
@@ -185,7 +205,7 @@ pub async fn load_manifest(
         // Scope for h_opt: we need a persistent &mut Option<&mut Hasher> so
         // read_segment_entry can be called multiple times without moving it.
         let mut h_opt: Option<&mut Hasher> = Some(&mut h);
-        if version == 1 {
+        if file_version == 1 {
             // V1: one segment per cluster
             for _ in 0..cc {
                 let cid = rle!(r, u32); hup!(h_opt, &cid.to_le_bytes());
@@ -217,10 +237,26 @@ pub async fn load_manifest(
 
     let metric = tm(mtag).ok_or(RabitqError::InvalidPersistence("unknown metric tag"))?;
     let rotator_type = RotatorType::from_u8(rtag).ok_or(RabitqError::InvalidPersistence("unknown rotator type"))?;
-    Ok((ManifestHeader { dim, padded_dim: pd, metric, rotator_type, rotator_data: rd, ex_bits: eb, total_bits: tb }, map))
+    Ok((ManifestHeader { generation, dim, padded_dim: pd, metric, rotator_type, rotator_data: rd, ex_bits: eb, total_bits: tb }, map))
 }
 
-// ---- manifest write (always V2) ----
+/// Load legacy manifest.bin (V1/V2 format).  Used for backward compat
+/// when no LATEST file exists in the store.
+pub async fn load_manifest(
+    store: &dyn ObjectStore,
+) -> Result<(ManifestHeader, BTreeMap<u32, ClusterManifestEntry>), RabitqError> {
+    read_manifest_bytes(store, MANIFEST_FILENAME).await
+}
+
+/// Load a versioned manifest by (generation, version).
+pub async fn load_manifest_by_gen_ver(
+    store: &dyn ObjectStore, generation: u64, version: u64,
+) -> Result<(ManifestHeader, BTreeMap<u32, ClusterManifestEntry>), RabitqError> {
+    let key = versioned_manifest_filename(generation, version);
+    read_manifest_bytes(store, &key).await
+}
+
+// ---- manifest write (always V3) ----
 
 fn write_segment_entry(w: &mut Vec<u8>, h: &mut Option<&mut Hasher>, seg: &SegmentManifestEntry) {
     wle!(w, seg.segment_version, u32);  hup_ref(h, &seg.segment_version.to_le_bytes());
@@ -235,12 +271,15 @@ pub async fn save_manifest(
     store: &dyn ObjectStore,
     header: &ManifestHeader,
     cluster_map: &BTreeMap<u32, ClusterManifestEntry>,
+    version: u64,
 ) -> Result<(), RabitqError> {
+    let key = StorePath::from(versioned_manifest_filename(header.generation, version));
     let mut b = Vec::new();
     b.write_all(&V4_MANIFEST_MAGIC).unwrap();
     wle!(b, V4_MANIFEST_VERSION, u32);
 
     let mut h = Hasher::new();
+    wle!(b, header.generation, u64); hup!(Some(&mut h), &header.generation.to_le_bytes());
     wle!(b, header.dim, u32);    hup!(Some(&mut h), &(header.dim as u32).to_le_bytes());
     wle!(b, header.padded_dim, u32); hup!(Some(&mut h), &(header.padded_dim as u32).to_le_bytes());
     wle!(b, mt(header.metric), u8); hup!(Some(&mut h), &[mt(header.metric)]);
@@ -265,7 +304,6 @@ pub async fn save_manifest(
     } // h_opt dropped — h is usable again
     wle!(b, h.finalize(), u32);
 
-    let key = StorePath::from(MANIFEST_FILENAME);
     store.put(&key, PutPayload::from_bytes(b.into())).await.map_err(os_err)?;
     Ok(())
 }
@@ -407,6 +445,58 @@ pub async fn delete_segment(store: &dyn ObjectStore, key: &str) -> Result<(), Ra
     store.delete(&StorePath::from(key)).await.map_err(os_err)
 }
 
+// ---- version control: LATEST file ----
+
+/// Read LATEST to get the current (generation, version) and etag for CAS.
+pub async fn read_latest(store: &dyn ObjectStore) -> Result<LatestSnapshot, RabitqError> {
+    let key = StorePath::from(LATEST_FILENAME);
+    match store.head(&key).await {
+        Ok(meta) => {
+            let bytes = store.get(&key).await.map_err(os_err)?.bytes().await.map_err(os_err)?;
+            let content = std::str::from_utf8(&bytes)
+                .map_err(|_| RabitqError::InvalidPersistence("LATEST not valid utf8"))?;
+            let mut parts = content.trim().split(':');
+            let gen: u64 = parts.next().and_then(|s| s.parse().ok())
+                .ok_or_else(|| RabitqError::InvalidPersistence("LATEST invalid format"))?;
+            let ver: u64 = parts.next().and_then(|s| s.parse().ok())
+                .ok_or_else(|| RabitqError::InvalidPersistence("LATEST invalid format"))?;
+            Ok(LatestSnapshot { generation: gen, version: ver, e_tag: meta.e_tag })
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(LatestSnapshot {
+            generation: 0, version: 0, e_tag: None,
+        }),
+        Err(e) => Err(os_err(e)),
+    }
+}
+
+/// Atomically write LATEST using CAS (If-Match on the expected etag).
+/// Returns the new etag on success, or `Error::VersionConflict` if the etag
+/// didn't match (someone else updated LATEST first).
+pub async fn write_latest(
+    store: &dyn ObjectStore,
+    generation: u64,
+    version: u64,
+    expected_etag: Option<String>,
+) -> Result<Option<String>, RabitqError> {
+    use object_store::PutMode;
+    let key = StorePath::from(LATEST_FILENAME);
+    let content = format!("{generation}:{version}");
+    let payload = PutPayload::from_bytes(content.into_bytes().into());
+    let update_ver = object_store::UpdateVersion { e_tag: expected_etag.clone(), version: None };
+    let opts = object_store::PutOptions {
+        mode: PutMode::Update(update_ver),
+        ..Default::default()
+    };
+    match store.put_opts(&key, payload, opts).await {
+        Ok(result) => Ok(result.e_tag),
+        Err(object_store::Error::Precondition { .. }) => Err(RabitqError::VersionConflict),
+        Err(e) => Err(os_err(e)),
+    }
+}
+
+// ---- backward-compat (existing V1/V2 manifest read) ----
+
 pub async fn manifest_exists(store: &dyn ObjectStore) -> bool {
     store.head(&StorePath::from(MANIFEST_FILENAME)).await.is_ok()
+        || store.head(&StorePath::from(LATEST_FILENAME)).await.is_ok()
 }
