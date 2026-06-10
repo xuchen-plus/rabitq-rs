@@ -1898,6 +1898,112 @@ impl IvfRabitqIndex {
         }
         best_cid
     }
+
+    /// Compaction: merge all delta segments into new base segments,
+    /// bump the generation, and atomically update the LATEST pointer.
+    ///
+    /// Reads the current manifest, loads all segments (base + deltas) for
+    /// every cluster, merges them in memory, writes new base segments
+    /// (version 0), writes a new manifest with `generation+1`, and
+    /// CAS-updates LATEST.
+    ///
+    /// Old segment files are **not** deleted (object-store immutability).
+    /// Other readers continue to use the old generation until they re-read
+    /// LATEST.
+    pub async fn compact_v4(store: &dyn ObjectStore) -> Result<(), RabitqError> {
+        use crate::manifest::{self, ClusterManifestEntry, ClusterSegmentData, ManifestHeader, SegmentManifestEntry};
+
+        // 1. Read current LATEST and load manifest.
+        let latest = manifest::read_latest(store).await?;
+        let (_, cluster_map) = if latest.generation > 0 {
+            manifest::load_manifest_by_gen_ver(store, latest.generation, latest.version).await?
+        } else {
+            manifest::load_manifest(store).await?
+        };
+
+        let new_gen = latest.generation.max(1) + 1;
+        println!("Compaction: gen {} → {}, {} clusters",
+                 latest.generation.max(1), new_gen, cluster_map.len());
+
+        // 2. Merge all segments for each cluster and write new base.
+        let mut new_map: std::collections::BTreeMap<u32, ClusterManifestEntry> =
+            std::collections::BTreeMap::new();
+
+        for (&cid, entry) in cluster_map.iter() {
+            // Merge all segments (base + deltas) for this cluster.
+            let mut merged: Option<ClusterData> = None;
+            for seg_entry in &entry.segments {
+                let seg = manifest::read_segment_full(store, &seg_entry.segment_filename).await?;
+                let cd = ClusterData::from_segment(seg);
+                if let Some(ref mut m) = merged {
+                    m.ids.extend_from_slice(&cd.ids);
+                    m.batch_data.extend_from_slice(&cd.batch_data);
+                    m.ex_codes_packed.extend_from_slice(&cd.ex_codes_packed);
+                    m.f_add_ex.extend_from_slice(&cd.f_add_ex);
+                    m.f_rescale_ex.extend_from_slice(&cd.f_rescale_ex);
+                    m.delta.extend_from_slice(&cd.delta);
+                    m.vl.extend_from_slice(&cd.vl);
+                    m.num_vectors += cd.num_vectors;
+                } else {
+                    merged = Some(cd);
+                }
+            }
+
+            let cd = merged
+                .ok_or_else(|| RabitqError::InvalidPersistence("cluster has no segments"))?;
+
+            // Write new compacted base segment (version 0).
+            let fname = manifest::segment_filename(cid, 0);
+            let seg_data = ClusterSegmentData::from_cluster_data(
+                cid, cd.centroid.clone(), cd.padded_dim, cd.ex_bits,
+                cd.ids.clone(), cd.batch_data.clone(),
+                cd.ex_codes_packed.clone(), cd.f_add_ex.clone(),
+                cd.f_rescale_ex.clone(), cd.delta.clone(), cd.vl.clone(),
+            );
+            let file_size = manifest::write_segment(store, &fname, &seg_data, 0).await?;
+
+            new_map.insert(cid, ClusterManifestEntry {
+                cluster_id: cid,
+                segments: vec![SegmentManifestEntry {
+                    segment_filename: fname,
+                    segment_version: 0,
+                    num_vectors: cd.num_vectors as u32,
+                    file_size,
+                }],
+            });
+        }
+
+        // 3. Write new-gen manifest (version 1), carrying forward header config.
+        let (old_header, _) = if latest.generation > 0 {
+            manifest::load_manifest_by_gen_ver(store, latest.generation, latest.version).await?
+        } else {
+            manifest::load_manifest(store).await?
+        };
+        let header = ManifestHeader {
+            generation: new_gen,
+            dim: old_header.dim,
+            padded_dim: old_header.padded_dim,
+            metric: old_header.metric,
+            rotator_type: old_header.rotator_type,
+            rotator_data: old_header.rotator_data,
+            ex_bits: old_header.ex_bits,
+            total_bits: old_header.total_bits,
+        };
+        manifest::save_manifest(store, &header, &new_map, 1).await?;
+
+        // 4. CAS-update LATEST.
+        manifest::write_latest(store, new_gen, 1, latest.e_tag).await
+            .map_err(|e| {
+                if matches!(e, RabitqError::VersionConflict) {
+                    RabitqError::InvalidPersistence(
+                        "compaction conflict: another process wrote LATEST during compaction"
+                    )
+                } else { e }
+            })?;
+
+        println!("Compaction complete: gen {} ({} segments)", new_gen, new_map.len());
+        Ok(())
+    }
 }
 
 // ----------------------------------------------------------------------------
