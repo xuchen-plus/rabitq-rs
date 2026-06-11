@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::time::Instant;
+use futures::StreamExt;
 use object_store::ObjectStore;
 use rand::rngs::StdRng;
 use rand::prelude::*;
@@ -12,6 +13,7 @@ use crate::rotation::{DynamicRotator, RotatorType};
 use crate::{Metric, RabitqError};
 use super::assign_batch_to_centroids;
 use super::cluster::ClusterData;
+use super::IdAndVecBatch;
 use super::IvfRabitqIndex;
 enum BuilderState {
     Fresh {
@@ -35,10 +37,6 @@ enum BuilderState {
         /// versions, sizes).  Used during incremental flush to locate
         /// and replace old segments.
         cluster_map: std::collections::BTreeMap<u32, crate::manifest::ClusterManifestEntry>,
-        /// Total original vectors (sum of all cluster entry num_vectors).
-        /// Used as the starting id for `insert_batch` so new vectors
-        /// get globally-unique ids.
-        original_total: usize,
     },
 }
 
@@ -103,12 +101,11 @@ impl IvfRabitqBuilder {
                 header.dim, header.padded_dim, header.rotator_type, &header.rotator_data,
             )?;
             let ip_func = crate::simd::select_excode_ipfunc(header.ex_bits);
-            let original_total: usize = cluster_map.values().map(|e| e.total_vectors()).sum();
             let index = IvfRabitqIndex {
                 dim: header.dim, padded_dim: header.padded_dim, metric: header.metric,
                 rotator, clusters, ex_bits: header.ex_bits, ip_func,
             };
-            return Ok(Self { state: BuilderState::Loaded { index, cluster_map, original_total } });
+            return Ok(Self { state: BuilderState::Loaded { index, cluster_map } });
         }
 
         let rotator = DynamicRotator::new(dim, rotator_type, seed);
@@ -126,20 +123,20 @@ impl IvfRabitqBuilder {
         })
     }
 
-    /// Push one flat batch `[n * dim]` into the builder.
+    /// Push one batch of ID'd vectors into the builder.
     ///
-    /// - **Fresh mode**: reservoir-samples vectors for k-means, drops batch.
+    /// - **Fresh mode**: reservoir-samples vectors for k-means (IDs ignored).
     /// - **Loaded mode**: rotates, finds centroids, quantises, appends to
-    ///   cluster pending buffers, drops batch.
-    pub fn insert_batch(&mut self, batch: Vec<f32>) -> Result<(), RabitqError> {
+    ///   cluster pending buffers with the provided external IDs.
+    pub fn insert_batch(&mut self, batch: IdAndVecBatch) -> Result<(), RabitqError> {
         match &mut self.state {
             BuilderState::Fresh { dim, reservoir, reservoir_capacity, reservoir_count, reservoir_seen, seed, .. } => {
                 let d = *dim;
-                let n = batch.len() / d;
+                let n = batch.vectors.len() / d;
                 let cap = *reservoir_capacity;
                 let mut rng = StdRng::seed_from_u64(seed.wrapping_add(*reservoir_seen as u64));
                 for i in 0..n {
-                    let v = &batch[i * d..(i + 1) * d];
+                    let v = &batch.vectors[i * d..(i + 1) * d];
                     if *reservoir_count < cap {
                         reservoir.extend_from_slice(v);
                         *reservoir_count += 1;
@@ -152,15 +149,10 @@ impl IvfRabitqBuilder {
                     }
                 }
                 *reservoir_seen += n;
-                // batch dropped
                 Ok(())
             }
-            BuilderState::Loaded { index, original_total, .. } => {
-                // `index.len()` returns 0 in lazy mode (centroids only).
-                // Use `original_total` from the manifest as the base id so
-                // new vectors receive globally-unique ids.
-                let start_id = *original_total + index.len();
-                index.insert_batch(start_id as u64, batch)?;
+            BuilderState::Loaded { index, .. } => {
+                index.insert_batch(batch)?;
                 Ok(())
             }
         }
@@ -169,13 +161,20 @@ impl IvfRabitqBuilder {
     /// Finalise the builder.
     ///
     /// - **Fresh mode**: runs k-means on reservoir samples, then streams
-    ///   `next_batch` to rotate + quantise all vectors.  Returns the built index.
+    ///   `make_stream` to rotate + quantise all vectors.  Returns the built
+    ///   index with the external IDs from the stream.
     /// - **Loaded mode**: flushes pending vectors into batch_data, returns
     ///   the index for persistence.
-    pub fn build(
+    pub async fn build<F, S>(
         self,
-        next_batch: Option<&mut impl FnMut() -> Option<Vec<f32>>>,
-    ) -> Result<IvfRabitqIndex, RabitqError> {
+        mut make_stream: F,
+    ) -> Result<IvfRabitqIndex, RabitqError>
+    where
+        F: FnMut() -> S,
+        S: futures::Stream<Item = IdAndVecBatch> + Unpin,
+    {
+        use futures::StreamExt;
+
         match self.state {
             BuilderState::Fresh {
                 dim, nlist, total_bits, metric, rotator_type, seed, use_faster_config,
@@ -185,9 +184,6 @@ impl IvfRabitqBuilder {
                 use crate::kmeans::{run_kmeans_on_flat, KMeansConfig};
                 use rayon::prelude::*;
 
-                let next_batch = next_batch
-                    .ok_or_else(|| RabitqError::InvalidConfig("build requires next_batch callback"))?;
-
                 println!("  Reservoir: {} / {} vectors ({:.1} MB)", reservoir_count, reservoir_seen,
                          reservoir_count * dim * 4 / (1024 * 1024));
                 if reservoir_count == 0 {
@@ -196,7 +192,6 @@ impl IvfRabitqBuilder {
 
                 let rotator = DynamicRotator::new(dim, rotator_type, seed);
 
-                // Rotate reservoir sample
                 let t_rot = Instant::now();
                 let mut rotated_sample = vec![0.0f32; reservoir_count * padded_dim];
                 rotated_sample
@@ -241,15 +236,18 @@ impl IvfRabitqBuilder {
                 let centroid_norms: Vec<f32> = rotated_centroids.iter().map(|c| c.iter().map(|x| x*x).sum()).collect();
 
                 println!("  Streaming rotation + quantisation...");
-                let mut global_id: usize = 0;
+                let mut total_vectors: usize = 0;
                 let mut bc: usize = 0;
                 let mut t_stream_rot = 0.0f64;
                 let mut t_stream_gemm = 0.0f64;
                 let mut t_stream_quant = 0.0f64;
                 let mut t_stream_append = 0.0f64;
                 const SUB_CHUNK: usize = 20_000;
-                while let Some(batch) = next_batch() {
-                    let bn = batch.len() / dim; bc += 1;
+
+                let mut stream = make_stream();
+                while let Some(batch) = stream.next().await {
+                    let bn = batch.vectors.len() / dim; bc += 1;
+                    assert_eq!(batch.ids.len() * dim, batch.vectors.len());
                     for sub_start in (0..bn).step_by(SUB_CHUNK) {
                         let sub_end = (sub_start + SUB_CHUNK).min(bn);
                         let sub_n = sub_end - sub_start;
@@ -260,7 +258,7 @@ impl IvfRabitqBuilder {
                             .enumerate()
                             .for_each(|(k, chunk)| {
                                 let i = sub_start + k;
-                                let v = &batch[i * dim..(i + 1) * dim];
+                                let v = &batch.vectors[i * dim..(i + 1) * dim];
                                 chunk.copy_from_slice(&rotator.rotate(v));
                             });
                         t_stream_rot += t0.elapsed().as_secs_f64();
@@ -279,20 +277,19 @@ impl IvfRabitqBuilder {
 
                         let t0 = Instant::now();
                         for (i, (cid, q)) in ins.into_iter().enumerate() {
-                            clusters[cid].append_vector((global_id + sub_start + i) as u64, q);
+                            clusters[cid].append_vector(batch.ids[sub_start + i], q);
                         }
                         t_stream_append += t0.elapsed().as_secs_f64();
                         drop(rb);
                         drop(bids);
                     }
-                    global_id += bn;
-                    drop(batch);
-                    if bc.is_multiple_of(10) { println!("    {} vectors...", global_id); }
+                    total_vectors += bn;
+                    if bc.is_multiple_of(10) { println!("    {} vectors...", total_vectors); }
                 }
                 let t_flush = Instant::now();
                 for c in &mut clusters { c.flush_pending(); }
                 let t_flush = t_flush.elapsed();
-                println!("  Build complete: {} vectors, {} clusters", global_id, clusters.len());
+                println!("  Build complete: {} vectors, {} clusters", total_vectors, clusters.len());
                 println!("  ── Phase timing ──");
                 println!("    rotate reservoir:  {:5.1}s", t_rot.as_secs_f64());
                 println!("    k-means (15 iter): {:5.1}s", t_km.as_secs_f64());

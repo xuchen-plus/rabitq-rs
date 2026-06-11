@@ -19,7 +19,7 @@ pub mod simd;
 
 pub use brute_force::{BruteForceRabitqIndex, BruteForceSearchParams, BruteForceSearchResult};
 pub use index::RabitqIndex;
-pub use ivf::{IvfRabitqIndex, SearchParams, SearchResult};
+pub use ivf::{IdAndVecBatch, IvfRabitqIndex, SearchParams, SearchResult, rebuild_v4};
 pub use ivf::builder::IvfRabitqBuilder;
 pub use quantizer::{QuantizedVector, RabitqConfig};
 pub use rotation::RotatorType;

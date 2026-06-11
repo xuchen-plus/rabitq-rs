@@ -1718,45 +1718,19 @@ impl IvfRabitqIndex {
         Ok(cid as u32)
     }
 
-    /// Batch-insert vectors with parallel rotation, centroid assignment
-    /// via GEMM, and parallel quantisation.
-    /// Batch-insert vectors with parallel rotation, centroid assignment via
-    /// GEMM, and parallel quantisation.  Accepts `&[Vec<f32>]`; for streaming
-    /// use `insert_batch` with flat data.
-    pub fn batch_insert(
-        &mut self,
-        start_id: u64,
-        vectors: &[Vec<f32>],
-    ) -> Result<(), RabitqError> {
-        let dim = self.dim;
-        let mut flat = Vec::with_capacity(vectors.len() * dim);
-        for v in vectors { flat.extend_from_slice(v); }
-        self.insert_batch(start_id, flat)?;
-        Ok(())
-    }
-
-    /// Insert a single flat batch `[n * dim]` into the index.
+    /// Insert a batch with external IDs.
     ///
     /// Vectors are rotated, assigned to nearest centroids via GEMM, quantised,
-    /// and appended to cluster pending buffers.  The batch is consumed and
-    /// freed on return.
-    ///
-    /// Returns the number of vectors inserted (so the caller can advance
-    /// `start_id`).
-    ///
-    /// After all batches have been pushed, call `flush_all_pending()` then
-    /// `flush_v4(dir, &dirty_cids)` to persist.
-    pub fn insert_batch(
-        &mut self,
-        start_id: u64,
-        flat_batch: Vec<f32>,
-    ) -> Result<usize, RabitqError> {
+    /// and appended to cluster pending buffers with the provided external IDs.
+    pub fn insert_batch(&mut self, batch: IdAndVecBatch) -> Result<(), RabitqError> {
         use rayon::prelude::*;
 
         let dim = self.dim;
         let padded_dim = self.padded_dim;
-        let n = flat_batch.len() / dim;
-        if n == 0 { return Ok(0); }
+        let n = batch.ids.len();
+        assert_eq!(batch.vectors.len(), n * dim,
+                   "IdAndVecBatch: vectors.len() must equal ids.len() × dim");
+        if n == 0 { return Ok(()); }
 
         // 1. Rotate batch (parallel, pre-allocated)
         let mut rotated = vec![0.0f32; n * padded_dim];
@@ -1764,12 +1738,12 @@ impl IvfRabitqIndex {
             .par_chunks_mut(padded_dim)
             .enumerate()
             .for_each(|(i, chunk)| {
-                let v = &flat_batch[i * dim..(i + 1) * dim];
+                let v = &batch.vectors[i * dim..(i + 1) * dim];
                 chunk.copy_from_slice(&self.rotator.rotate(v));
             });
-        drop(flat_batch);
+        drop(batch.vectors);
 
-        // 2. Build centroid matrix + norms (cached across calls by caller, but cheap)
+        // 2. Build centroid matrix + norms
         let k = self.clusters.len();
         let centroid_col: Vec<f32> = {
             let mut col = vec![0.0f32; padded_dim * k];
@@ -1823,12 +1797,12 @@ impl IvfRabitqIndex {
 
         drop(rotated);
 
-        // 5. Append to clusters
+        // 5. Append to clusters with external IDs
         for (i, (cid, q)) in results.into_iter().enumerate() {
-            self.clusters[cid].append_vector(start_id + i as u64, q);
+            self.clusters[cid].append_vector(batch.ids[i], q);
         }
 
-        Ok(n)
+        Ok(())
     }
 
     /// Flush dirty clusters to V4 directory: writes a **compaction** segment
@@ -2004,6 +1978,153 @@ impl IvfRabitqIndex {
         println!("Compaction complete: gen {} ({} segments)", new_gen, new_map.len());
         Ok(())
     }
+}
+
+// ============================================================================
+// rebuild_v4: full rebuild from external data stream
+// ============================================================================
+
+/// A batch of vectors with their external IDs, used as input to
+/// [`rebuild_v4`].
+#[derive(Debug, Clone)]
+pub struct IdAndVecBatch {
+    /// External vector IDs (one per vector, must be globally unique).
+    pub ids: Vec<u64>,
+    /// Flat row-major vector data: `[batch_n × dim]` f32 values.
+    pub vectors: Vec<f32>,
+}
+
+impl IdAndVecBatch {
+    /// Number of vectors in this batch.
+    pub fn len(&self) -> usize { self.ids.len() }
+    /// True if the batch is empty.
+    pub fn is_empty(&self) -> bool { self.ids.is_empty() }
+}
+
+/// Completely rebuild the IVF+RaBitQ index from an external async data
+/// stream.
+///
+/// This runs full K-Means training on a reservoir-sampled subset followed
+/// by streaming rotation, centroid assignment, and RaBitQ quantisation of
+/// every input vector.  The result is a **new generation** of the index:
+/// new centroids, new segments, new manifest, and an atomic LATEST update.
+///
+/// # Arguments
+///
+/// * `make_stream` — A factory closure that returns a fresh
+///   `futures::Stream<Item = IdAndVecBatch>`.  It is called **twice**:
+///   once for the reservoir-sampling pass and once for the streaming
+///   build pass.  Each call should produce an independent stream over the
+///   same data.
+///
+/// # Panics
+///
+/// Panics if any batch has mismatched dimensions or an ID count that
+/// doesn't match its vector count.
+pub async fn rebuild_v4<F, S>(
+    store: Arc<dyn ObjectStore>,
+    dim: usize,
+    nlist: usize,
+    total_bits: usize,
+    metric: Metric,
+    rotator_type: RotatorType,
+    seed: u64,
+    faster_config: bool,
+    mut make_stream: F,
+) -> Result<(), RabitqError>
+where
+    F: FnMut() -> S,
+    S: futures::Stream<Item = IdAndVecBatch> + Unpin,
+{
+    use futures::StreamExt;
+    use crate::manifest::{self, ClusterManifestEntry, ClusterSegmentData, ManifestHeader, SegmentManifestEntry};
+    use builder::IvfRabitqBuilder;
+
+    // 1. Read current LATEST, determine new generation.
+    let latest = manifest::read_latest(&*store).await?;
+    let new_gen = latest.generation.max(1) + 1;
+    println!("rebuild_v4: gen {} → {} ({} clusters, {} bits)",
+             latest.generation.max(1), new_gen, nlist, total_bits);
+
+    // 2. Fresh builder — no manifest exists for a fresh build.
+    let mut builder = IvfRabitqBuilder::load(
+        store.clone(),
+        dim, nlist, total_bits, metric, rotator_type, seed, faster_config,
+    ).await?;
+
+    // -- Phase 1: reservoir sampling --
+    println!("  Phase 1: reservoir sampling...");
+    let mut seen: usize = 0;
+    {
+        let mut stream = make_stream();
+        while let Some(batch) = stream.next().await {
+            let n = batch.ids.len();
+            seen += n;
+            builder.insert_batch(batch)?;
+        }
+    }
+    println!("  Phase 1 complete: {} vectors streamed", seen);
+    if seen == 0 {
+        return Err(RabitqError::InvalidConfig("no vectors in rebuild stream"));
+    }
+
+    // -- Phase 2: build (K-Means + streaming rotation + quantisation) --
+    println!("  Phase 2: building (K-Means + streaming quantisation)...");
+    let index = builder.build(make_stream).await?;
+
+    println!("  Build complete: {} vectors, {} clusters, {:.1} MB",
+             index.len(), index.cluster_count(), index.estimate_memory_mb());
+
+    // 3. Persist with new generation.
+    // Write base segments (version 0) per cluster, then versioned manifest.
+    let mut cluster_map: std::collections::BTreeMap<u32, ClusterManifestEntry> =
+        std::collections::BTreeMap::new();
+    for (i, cluster) in index.clusters.iter().enumerate() {
+        let cid = i as u32;
+        let fname = manifest::segment_filename(cid, 0);
+        let seg_data = ClusterSegmentData::from_cluster_data(
+            cid, cluster.centroid.clone(), index.padded_dim, index.ex_bits,
+            cluster.ids.clone(), cluster.batch_data.clone(),
+            cluster.ex_codes_packed.clone(), cluster.f_add_ex.clone(),
+            cluster.f_rescale_ex.clone(), cluster.delta.clone(), cluster.vl.clone(),
+        );
+        let file_size = manifest::write_segment(&*store, &fname, &seg_data, 0).await?;
+        cluster_map.insert(cid, ClusterManifestEntry {
+            cluster_id: cid,
+            segments: vec![SegmentManifestEntry {
+                segment_filename: fname,
+                segment_version: 0,
+                num_vectors: cluster.num_vectors as u32,
+                file_size,
+            }],
+        });
+    }
+
+    let header = ManifestHeader {
+        generation: new_gen,
+        dim: index.dim,
+        padded_dim: index.padded_dim,
+        metric: index.metric,
+        rotator_type: index.rotator.rotator_type(),
+        rotator_data: index.rotator.serialize(),
+        ex_bits: index.ex_bits,
+        total_bits: index.ex_bits + 1,
+    };
+    manifest::save_manifest(&*store, &header, &cluster_map, 1).await?;
+
+    // 4. CAS LATEST.
+    manifest::write_latest(&*store, new_gen, 1, latest.e_tag).await
+        .map_err(|e| {
+            if matches!(e, RabitqError::VersionConflict) {
+                RabitqError::InvalidPersistence(
+                    "rebuild conflict: another process wrote LATEST during rebuild"
+                )
+            } else { e }
+        })?;
+
+    println!("rebuild_v4 complete: gen {} ({} base segments, {} vectors)",
+             new_gen, cluster_map.len(), index.len());
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------

@@ -23,11 +23,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::stream;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 
 use rabitq_rs::io::{read_fvecs, read_ids};
-use rabitq_rs::{IvfRabitqBuilder, IvfRabitqIndex, Metric, RotatorType};
+use rabitq_rs::{IdAndVecBatch, IvfRabitqBuilder, IvfRabitqIndex, Metric, RotatorType};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SaveFormat { V3, V4 }
@@ -267,8 +268,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for chunk in all_new.chunks(batch_size) {
                         let mut flat = Vec::with_capacity(chunk.len() * dim);
                         for v in chunk { flat.extend_from_slice(v); }
-                        builder.insert_batch(flat)?;
-                        total_inserted += chunk.len();
+                        let n = chunk.len();
+                        let ids: Vec<u64> = (0..n as u64).collect();
+                        builder.insert_batch(IdAndVecBatch { ids, vectors: flat })?;
+                        total_inserted += n;
                     }
                     println!("  Inserted {} vectors in {:.1}s ({:.0} vec/s)",
                              total_inserted, t0.elapsed().as_secs_f64(),
@@ -293,7 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // V3: traditional load/insert/save path
-        let index = IvfRabitqIndex::load_from_path(load_path)?;
+        let mut index = IvfRabitqIndex::load_from_path(load_path)?;
         println!("  Loaded in {:.1}s  ({} vectors, {} clusters, {:.1} MB)",
                  t0.elapsed().as_secs_f64(), index.len(), index.cluster_count(), index.estimate_memory_mb());
         if let Some(ref ip) = args.insert {
@@ -303,12 +306,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !all_new.is_empty() {
                 let batch_size = 50_000;
                 let mut start_id = index.len() as u64;
-                let mut index = index;
                 let t0 = Instant::now();
                 for chunk in all_new.chunks(batch_size) {
                     let mut flat = Vec::with_capacity(chunk.len() * dim);
                     for v in chunk { flat.extend_from_slice(v); }
-                    let n = index.insert_batch(start_id, flat)?;
+                    let n = chunk.len();
+                    let ids: Vec<u64> = (start_id..start_id + n as u64).collect();
+                    index.insert_batch(IdAndVecBatch { ids, vectors: flat })?;
                     start_id += n as u64;
                 }
                 index.flush_all_pending();
@@ -359,17 +363,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut seen: usize = 0;
         {
             let mut rdr = BatchReader::new(base, dim, batch_size, args.limit)?;
-            while let Some(batch) = rdr.next_batch() {
-                seen += batch.len() / dim;
-                builder.insert_batch(batch)?;
+            while let Some(flat) = rdr.next_batch() {
+                let n = flat.len() / dim;
+                seen += n;
+                // Reservoir phase doesn't use IDs — use placeholder.
+                let ids: Vec<u64> = (0..n as u64).collect();
+                builder.insert_batch(IdAndVecBatch { ids, vectors: flat })?;
             }
         }
         println!("  Reservoir: processed {} vectors in {:.1}s", seen, t0.elapsed().as_secs_f64());
 
-        // Phase 2: build (streaming — one batch at a time via callback)
+        // Phase 2: build (collect batches into vec for async stream)
         println!("Phase 2: building (streaming rotation + quantization)...");
-        let mut rdr2 = BatchReader::new(base, dim, batch_size, args.limit)?;
-        builder.build(Some(&mut || rdr2.next_batch()))?
+        let mut batches: Vec<IdAndVecBatch> = Vec::new();
+        {
+            let mut rdr = BatchReader::new(base, dim, batch_size, args.limit)?;
+            while let Some(flat) = rdr.next_batch() {
+                let n = flat.len() / dim;
+                let ids: Vec<u64> = (0..n as u64).collect();
+                batches.push(IdAndVecBatch { ids, vectors: flat });
+            }
+        }
+        rt.block_on(builder.build(move || {
+            futures::stream::iter(batches.clone())
+        }))?
     } else if let (Some(cp), Some(ap)) = (&args.centroids, &args.assignments) {
         // ── V3: pre-clustered ──
         let vectors = read_fvecs(base, args.limit)?;
